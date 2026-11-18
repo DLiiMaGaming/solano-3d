@@ -165,10 +165,69 @@ function lerp(a, b, t) { return a + (b - a) * t; }
 function lerpAngle(a, b, t) { let d = (b - a) % (Math.PI * 2);
   if (d > Math.PI) d -= Math.PI * 2; if (d < -Math.PI) d += Math.PI * 2; return a + d * t; }
 
+/* ---- geometry batching helpers (draw-call reduction) ---- */
+/* clone a geometry with a baked transform (position / euler / scale) */
+function xg(geo, x, y, z, sx, sy, sz, euler) {
+  const g = geo.clone();
+  const q = new THREE.Quaternion().setFromEuler(euler || new THREE.Euler());
+  g.applyMatrix4(new THREE.Matrix4().compose(
+    new THREE.Vector3(x, y, z), q,
+    new THREE.Vector3(sx == null ? 1 : sx, sy == null ? 1 : sy, sz == null ? 1 : sz)));
+  return g;
+}
+/* merge transformed geometries into one BufferGeometry (single material;
+   carries a per-vertex 'color' attribute through when present) */
+function mergeGeos(list) {
+  const pos = [], nor = [], uv = [], col = [], idx = [];
+  const hasCol = !!list[0].attributes.color;
+  let off = 0;
+  for (const g0 of list) {
+    const g = g0.index ? g0.toNonIndexed() : g0;
+    const p = g.attributes.position, n = g.attributes.normal, u = g.attributes.uv, c = g.attributes.color;
+    for (let i = 0; i < p.count; i++) {
+      pos.push(p.getX(i), p.getY(i), p.getZ(i));
+      nor.push(n.getX(i), n.getY(i), n.getZ(i));
+      uv.push(u ? u.getX(i) : 0, u ? u.getY(i) : 0);
+      if (hasCol) col.push(c ? c.getX(i) : 1, c ? c.getY(i) : 1, c ? c.getZ(i) : 1);
+    }
+    for (let i = 0; i < p.count; i++) idx.push(off + i);
+    off += p.count;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  if (hasCol) geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  geo.setIndex(idx);
+  return geo;
+}
+function colored(geo, hex) {
+  const c = new THREE.Color(hex), n = geo.attributes.position.count;
+  const arr = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) { arr[i * 3] = c.r; arr[i * 3 + 1] = c.g; arr[i * 3 + 2] = c.b; }
+  geo.setAttribute('color', new THREE.BufferAttribute(arr, 3));
+  return geo;
+}
+/* one InstancedMesh from [x,y,z, sx,sy,sz, rx,ry,rz] transform tuples */
+function makeInstanced(geo, mat, list, cast, receive) {
+  const im = new THREE.InstancedMesh(geo, mat, list.length);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
+  for (let i = 0; i < list.length; i++) {
+    const t = list[i];
+    e.set(t[6] || 0, t[7] || 0, t[8] || 0); q.setFromEuler(e);
+    m.compose(new THREE.Vector3(t[0], t[1], t[2]), q, new THREE.Vector3(t[3], t[4], t[5]));
+    im.setMatrixAt(i, m);
+  }
+  im.castShadow = !!cast; im.receiveShadow = !!receive;
+  im.frustumCulled = false;
+  scene.add(im);
+  return im;
+}
+
 /* ---------------- renderer / scene / camera ---------------- */
 const app = document.getElementById('app');
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.75));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -187,10 +246,13 @@ scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xffd9a6, 2.5);
 sun.position.set(-170, 105, -75);
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
-sun.shadow.camera.left = -195; sun.shadow.camera.right = 195;
-sun.shadow.camera.top = 195; sun.shadow.camera.bottom = -195;
-sun.shadow.camera.near = 20; sun.shadow.camera.far = 520;
+sun.shadow.mapSize.set(1024, 1024);
+/* tight shadow frustum that follows the player (updated per frame in
+   animate): crisper shadows from a 1024 map over ±58 m than a 2048 map
+   over ±195 m, and a much cheaper shadow pass */
+sun.shadow.camera.left = -58; sun.shadow.camera.right = 58;
+sun.shadow.camera.top = 58; sun.shadow.camera.bottom = -58;
+sun.shadow.camera.near = 40; sun.shadow.camera.far = 320;
 sun.shadow.bias = -0.0003; sun.shadow.normalBias = 1.2;
 scene.add(sun); scene.add(sun.target);
 
@@ -217,13 +279,12 @@ function makeCanvas(w, h, fn) {
   /* soft low-poly clouds */
   const cloudMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.82, fog: false });
   const cloudGeo = new THREE.SphereGeometry(1, 10, 8);
+  const cloudParts = [];
   for (let i = 0; i < 7; i++) {
-    const cl = new THREE.Mesh(cloudGeo, cloudMat);
     const s = rr(16, 34);
-    cl.scale.set(s, s * 0.24, s * 0.55);
-    cl.position.set(rr(-420, 420), rr(95, 150), rr(-420, 420));
-    scene.add(cl);
+    cloudParts.push(xg(cloudGeo, rr(-420, 420), rr(95, 150), rr(-420, 420), s, s * 0.24, s * 0.55));
   }
+  scene.add(new THREE.Mesh(mergeGeos(cloudParts), cloudMat));
 }
 
 /* ---------------- world constants ---------------- */
@@ -231,7 +292,7 @@ const STREETS = [-104, -52, 0, 52, 104];   // street centre lines (x and z)
 const ROAD_HALF = 6;
 const colliders = [];    // {minX,maxX,minZ,maxZ} buildings & big props
 const circles = [];      // {x,z,r,ref} cars & small props (dynamic entries flagged)
-function addCollider(x, z, w, d) { colliders.push({ minX: x - w / 2, maxX: x + w / 2, minZ: z - d / 2, maxZ: z + d / 2 }); }
+function addCollider(x, z, w, d) { const c = { minX: x - w / 2, maxX: x + w / 2, minZ: z - d / 2, maxZ: z + d / 2 }; colliders.push(c); return c; }
 function groundY(x, z) {  // pier deck
   if (x >= 146 && x <= 234 && Math.abs(z) <= 5.5) {
     if (x < 152) return 0.5 * (x - 146) / 6;
@@ -376,18 +437,19 @@ const facades = ['#e8dcc8', '#d9a066', '#b8ccd4', '#e3b7a0', '#cfe0da', '#f0e6d2
 const towerFacade = makeFacade('#7fa8c9', true);
 const acMat = new THREE.MeshLambertMaterial({ color: 0x9aa0a3 });
 let buildingCount = 0;
+/* buildings are collected as instance transforms and drawn as a handful
+   of InstancedMeshes (one per facade material + roofs + AC units)
+   instead of ~100 multi-material meshes */
+const bXforms = facades.map(() => []);
+const towerXforms = [], acXforms = [], roofXforms = [];
 function addBuilding(x, z, w, d, h, mat) {
-  const m = new THREE.Mesh(unitBox, [mat, mat, roofMat, darkMat, mat, mat]);
-  m.scale.set(w, h, d); m.position.set(x, h / 2, z);
-  m.castShadow = true; m.receiveShadow = true;
-  scene.add(m); addCollider(x, z, w, d); buildingCount++;
-  if (h > 10 && rnd() > 0.45) {  // rooftop AC unit
-    const ac = new THREE.Mesh(unitBox, acMat);
-    ac.scale.set(rr(1.4, 2.6), 0.9, rr(1.4, 2.4));
-    ac.position.set(x + rr(-w / 4, w / 4), h + 0.45, z + rr(-d / 4, d / 4));
-    ac.castShadow = true; scene.add(ac);
+  (mat === towerFacade ? towerXforms : bXforms[facades.indexOf(mat)]).push([x, h / 2, z, w, h, d]);
+  roofXforms.push([x, h + 0.02, z, w, 1, d]);
+  addCollider(x, z, w, d); buildingCount++;
+  if (h > 10 && rnd() > 0.45) {  // rooftop AC unit (instanced below)
+    const sx = rr(1.4, 2.6), sz = rr(1.4, 2.4);
+    acXforms.push([x + rr(-w / 4, w / 4), h + 0.45, z + rr(-d / 4, d / 4), sx, 0.9, sz]);
   }
-  return m;
 }
 for (const sx of STREETS.slice(0, 4)) for (const sz of STREETS.slice(0, 4)) {
   const cx = sx + 26, cz = sz + 26;
@@ -412,6 +474,19 @@ for (const sx of STREETS.slice(0, 4)) for (const sz of STREETS.slice(0, 4)) {
     addBuilding(x0 + ix * (lot + gap) + w / 2, z0 + iz * (lot + gap) + d / 2, w - 0.7, d - 0.7, h, pick(facades));
   }
 }
+/* emit the instanced building meshes: facade sides are four planes with
+   the full facade texture per face (same mapping the box faces had) */
+{
+  const sideParts = [];
+  const mkSide = (ry, x, z) => { const p = new THREE.PlaneGeometry(1, 1); p.rotateY(ry); p.translate(x, 0, z); sideParts.push(p); };
+  mkSide(0, 0, 0.5); mkSide(Math.PI, 0, -0.5); mkSide(Math.PI / 2, 0.5, 0); mkSide(-Math.PI / 2, -0.5, 0);
+  const sidesGeo = mergeGeos(sideParts);
+  facades.forEach((mat, i) => { if (bXforms[i].length) makeInstanced(sidesGeo, mat, bXforms[i], true, true); });
+  if (towerXforms.length) makeInstanced(sidesGeo, towerFacade, towerXforms, true, true);
+  const roofGeo = new THREE.PlaneGeometry(1, 1); roofGeo.rotateX(-Math.PI / 2);
+  makeInstanced(roofGeo, roofMat, roofXforms, false, true);
+  if (acXforms.length) makeInstanced(unitBox, acMat, acXforms, true, false);
+}
 
 /* ---------------- vegetation & street furniture ---------------- */
 const trunkMat = new THREE.MeshLambertMaterial({ color: 0x8a6a4a });
@@ -421,27 +496,21 @@ const palmTrunkGeo = new THREE.CylinderGeometry(0.14, 0.22, 5.6, 6);
 const palmLeafGeo = new THREE.ConeGeometry(0.55, 3.6, 4);
 const treeTrunkGeo = new THREE.CylinderGeometry(0.16, 0.24, 2.2, 6);
 const treeTopGeo = new THREE.IcosahedronGeometry(1.7, 0);
+const palmTrunks = [], palmLeaves = [], treeTrunks = [], treeTops = [];
 function addPalm(x, z) {
-  const g = new THREE.Group();
-  const trunk = new THREE.Mesh(palmTrunkGeo, trunkMat);
-  trunk.position.y = 2.8; trunk.rotation.z = rr(-0.09, 0.09); trunk.castShadow = true; g.add(trunk);
+  const gy = groundY(x, z);
+  palmTrunks.push([x, gy + 2.8, z, 1, 1, 1, 0, 0, rr(-0.09, 0.09)]);
   for (let i = 0; i < 6; i++) {
-    const leaf = new THREE.Mesh(palmLeafGeo, palmLeafMat);
     const a = (i / 6) * Math.PI * 2 + rr(-0.3, 0.3);
-    leaf.scale.set(0.55, 1, 0.1);
-    leaf.position.set(Math.cos(a) * 1.1, 5.9, Math.sin(a) * 1.1);
-    leaf.rotation.set(Math.sin(a) * 1.15, 0, -Math.cos(a) * 1.15 + Math.PI);
-    leaf.castShadow = true; g.add(leaf);
+    palmLeaves.push([x + Math.cos(a) * 1.1, gy + 5.9, z + Math.sin(a) * 1.1, 0.55, 1, 0.1,
+      Math.sin(a) * 1.15, 0, -Math.cos(a) * 1.15 + Math.PI]);
   }
-  g.position.set(x, groundY(x, z), z); scene.add(g);
   circles.push({ x, z, r: 0.45, ref: null });
 }
 function addTree(x, z) {
-  const g = new THREE.Group();
-  const trunk = new THREE.Mesh(treeTrunkGeo, trunkMat); trunk.position.y = 1.1; trunk.castShadow = true; g.add(trunk);
-  const top = new THREE.Mesh(treeTopGeo, leafMat);
-  top.position.y = rr(3.1, 3.9); top.scale.y = 1.2; top.castShadow = true; g.add(top);
-  g.position.set(x, groundY(x, z), z); scene.add(g);
+  const gy = groundY(x, z);
+  treeTrunks.push([x, gy + 1.1, z, 1, 1, 1]);
+  treeTops.push([x, gy + rr(3.1, 3.9), z, 1, 1.2, 1]);
   circles.push({ x, z, r: 0.5, ref: null });
 }
 /* palms along the coast promenade + beach, trees in the park and around town */
@@ -450,48 +519,63 @@ for (let i = 0; i < 9; i++) addTree(-26 + rr(-16, 16), 26 + rr(-16, 16));
 for (let i = 0; i < 10; i++) { const x = rr(-140, 100), z = rr(-140, 140);
   if (STREETS.some(s => Math.abs(x - s) < 10 || Math.abs(z - s) < 10)) continue; addTree(x, z); }
 addPalm(160, -30); addPalm(160, 34); addPalm(140, -70); addPalm(142, 84);
+makeInstanced(palmTrunkGeo, trunkMat, palmTrunks, true, false);
+makeInstanced(palmLeafGeo, palmLeafMat, palmLeaves, true, false);
+makeInstanced(treeTrunkGeo, trunkMat, treeTrunks, true, false);
+makeInstanced(treeTopGeo, leafMat, treeTops, true, false);
 
 /* street lamps */
 const lampPoleGeo = new THREE.CylinderGeometry(0.07, 0.09, 5.4, 6);
 const lampHeadGeo = new THREE.SphereGeometry(0.3, 8, 6);
 const lampPoleMat = new THREE.MeshLambertMaterial({ color: 0x3a4148 });
 const lampHeadMat = new THREE.MeshLambertMaterial({ color: 0xffe6b0, emissive: 0xffc36b, emissiveIntensity: 0.9 });
+const lampPoles = [], lampHeads = [];
 for (const s of STREETS) for (let t = -130; t <= 130; t += 26) {
   for (const off of [-7.2, 7.2]) {
     if (rnd() < 0.25) continue;
-    const pole = new THREE.Mesh(lampPoleGeo, lampPoleMat);
-    pole.position.set(s + off, 2.7, t + (off > 0 ? 13 : 0)); pole.castShadow = true; scene.add(pole);
-    const head = new THREE.Mesh(lampHeadGeo, lampHeadMat);
-    head.position.copy(pole.position); head.position.y = 5.5; scene.add(head);
-    const pole2 = new THREE.Mesh(lampPoleGeo, lampPoleMat);
-    pole2.position.set(t + (off > 0 ? 13 : 0), 2.7, s + off); pole2.castShadow = true; scene.add(pole2);
-    const head2 = new THREE.Mesh(lampHeadGeo, lampHeadMat);
-    head2.position.copy(pole2.position); head2.position.y = 5.5; scene.add(head2);
+    const ax = s + off, az = t + (off > 0 ? 13 : 0);
+    const bx = t + (off > 0 ? 13 : 0), bz = s + off;
+    lampPoles.push([ax, 2.7, az, 1, 1, 1]); lampHeads.push([ax, 5.5, az, 1, 1, 1]);
+    lampPoles.push([bx, 2.7, bz, 1, 1, 1]); lampHeads.push([bx, 5.5, bz, 1, 1, 1]);
   }
 }
+makeInstanced(lampPoleGeo, lampPoleMat, lampPoles, true, false);
+makeInstanced(lampHeadGeo, lampHeadMat, lampHeads, false, false);
 /* crates & barriers near the marina and works areas */
 const crateMat = new THREE.MeshLambertMaterial({ color: 0xb08954 });
 const crateMat2 = new THREE.MeshLambertMaterial({ color: 0x7d94a6 });
-function addCrate(x, z, s, mat) { const m = new THREE.Mesh(unitBox, mat || crateMat);
-  m.scale.set(s, s, s); m.position.set(x, s / 2, z); m.rotation.y = rr(0, 0.6);
-  m.castShadow = true; m.receiveShadow = true; scene.add(m); addCollider(x, z, s * 1.15, s * 1.15); }
+const cratePartsA = [], cratePartsB = [];
+function addCrate(x, z, s, mat) {
+  (mat === crateMat2 ? cratePartsB : cratePartsA).push(
+    xg(unitBox, x, s / 2, z, s, s, s, new THREE.Euler(0, rr(0, 0.6), 0)));
+  addCollider(x, z, s * 1.15, s * 1.15).top = s; }   // crates are standable: record the top
 addCrate(132, -14, 2.2); addCrate(134.6, -13.4, 1.6); addCrate(132.6, -11.2, 1.4, crateMat2);
 addCrate(133, 16, 2.0, crateMat2); addCrate(135.4, 16.8, 1.5);
 addCrate(-70, -128, 2.4); addCrate(-67.2, -127, 1.7); addCrate(-70.5, -124.8, 1.5, crateMat2);
+for (const [parts, mat] of [[cratePartsA, crateMat], [cratePartsB, crateMat2]]) {
+  if (!parts.length) continue;
+  const m = new THREE.Mesh(mergeGeos(parts), mat);
+  m.castShadow = true; m.receiveShadow = true; scene.add(m);
+}
 const barrierMatA = new THREE.MeshLambertMaterial({ color: 0xe8641e });
 const barrierMatB = new THREE.MeshLambertMaterial({ color: 0xf2f2ee });
+const barA = [], barB = [], barLeg = [];
 for (let i = 0; i < 5; i++) { const bx = 118.5, bz = -46 + i * 3.4;
-  const b1 = new THREE.Mesh(unitBox, barrierMatA); b1.scale.set(0.5, 0.55, 3); b1.position.set(bx, 0.75, bz); b1.castShadow = true; scene.add(b1);
-  const b2 = new THREE.Mesh(unitBox, barrierMatB); b2.scale.set(0.52, 0.2, 3); b2.position.set(bx, 0.95, bz); scene.add(b2);
-  const leg = new THREE.Mesh(unitBox, darkMat); leg.scale.set(0.4, 0.5, 2.6); leg.position.set(bx, 0.25, bz); scene.add(leg);
+  barA.push(xg(unitBox, bx, 0.75, bz, 0.5, 0.55, 3));
+  barB.push(xg(unitBox, bx, 0.95, bz, 0.52, 0.2, 3));
+  barLeg.push(xg(unitBox, bx, 0.25, bz, 0.4, 0.5, 2.6));
   addCollider(bx, bz, 0.7, 3.1); }
+{ const mA = new THREE.Mesh(mergeGeos(barA), barrierMatA); mA.castShadow = true; scene.add(mA);
+  scene.add(new THREE.Mesh(mergeGeos(barB), barrierMatB));
+  scene.add(new THREE.Mesh(mergeGeos(barLeg), darkMat)); }
 /* park benches + fountain */
 const benchMat = new THREE.MeshLambertMaterial({ color: 0x7a5c38 });
+const benchParts = [];
 for (const [bx, bz, ry] of [[-38, 14, 0.4], [-14, 14, -0.4], [-38, 38, 2.6], [-14, 38, 3.6], [-26, 12, 0], [-26, 40, Math.PI]]) {
-  const b = new THREE.Mesh(unitBox, benchMat); b.scale.set(2.2, 0.5, 0.6);
-  b.position.set(bx, 0.45, bz); b.rotation.y = ry; b.castShadow = true; scene.add(b);
+  benchParts.push(xg(unitBox, bx, 0.45, bz, 2.2, 0.5, 0.6, new THREE.Euler(0, ry, 0)));
   circles.push({ x: bx, z: bz, r: 1.0, ref: null });
 }
+{ const m = new THREE.Mesh(mergeGeos(benchParts), benchMat); m.castShadow = true; scene.add(m); }
 {
   const basin = new THREE.Mesh(new THREE.CylinderGeometry(4.4, 4.8, 1.0, 18),
     new THREE.MeshLambertMaterial({ color: 0xb9c0c2 }));
@@ -510,9 +594,10 @@ const pier = new THREE.Mesh(unitBox, pierMat);
 pier.scale.set(88, 0.5, 11); pier.position.set(190, 0.25, 0);
 pier.receiveShadow = true; pier.castShadow = true; scene.add(pier);
 const postGeo = new THREE.CylinderGeometry(0.22, 0.22, 1.6, 6);
-for (let x = 156; x <= 230; x += 12) for (const pz of [-5.2, 5.2]) {
-  const p = new THREE.Mesh(postGeo, pierMat); p.position.set(x, -0.2, pz); scene.add(p);
-}
+const postParts = [];
+for (let x = 156; x <= 230; x += 12) for (const pz of [-5.2, 5.2])
+  postParts.push(xg(postGeo, x, -0.2, pz, 1, 1, 1));
+scene.add(new THREE.Mesh(mergeGeos(postParts), pierMat));
 const boats = [];
 function addBoat(x, z, ry, hullColor, sail) {
   const g = new THREE.Group();
@@ -543,49 +628,122 @@ addBoat(226, 11, 0.05, 0xe8b13c, false);
 
 /* ---------------- cars ---------------- */
 const glassMat = new THREE.MeshPhongMaterial({ color: 0x1d2733, shininess: 90, specular: 0x88aacc });
-const tireMat = new THREE.MeshLambertMaterial({ color: 0x17181a });
-const hubMat = new THREE.MeshLambertMaterial({ color: 0x9aa0a4 });
 const headMat = new THREE.MeshLambertMaterial({ color: 0xfff3c4, emissive: 0xffedb5, emissiveIntensity: 0.7 });
 const tailMat = new THREE.MeshLambertMaterial({ color: 0xd92b2b, emissive: 0xa11212, emissiveIntensity: 0.7 });
-const wheelGeo = new THREE.CylinderGeometry(0.34, 0.34, 0.26, 14);
-const hubGeo = new THREE.CylinderGeometry(0.17, 0.17, 0.28, 10);
+/* one wheel (tire + hubcap in a single vertex-colored geometry) and a
+   merged rear axle pair — 3 wheel meshes per car instead of 8 */
+const wheelMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+const wheelGeo = (() => {
+  const tire = new THREE.CylinderGeometry(0.34, 0.34, 0.26, 14); tire.rotateZ(Math.PI / 2);
+  const rim = new THREE.CylinderGeometry(0.21, 0.21, 0.28, 12); rim.rotateZ(Math.PI / 2);
+  const cap = new THREE.CylinderGeometry(0.08, 0.08, 0.3, 8); cap.rotateZ(Math.PI / 2);
+  return mergeGeos([colored(tire, 0x17181a), colored(rim, 0xc9ced4), colored(cap, 0x3a3d40)]);
+})();
+/* one shared vertex-colored material for every car body: paint and trim
+   colours are baked per-vertex, so all the detail parts below ride in
+   the SAME merged mesh as the shell — detail costs no draw calls */
+const carPaintMat = new THREE.MeshPhongMaterial({ vertexColors: true, shininess: 70, specular: 0x555555 });
+const rearAxleGeo = (() => {
+  const l = wheelGeo.clone(); l.translate(-0.88, 0, 0);
+  const r = wheelGeo.clone(); r.translate(0.88, 0, 0);
+  return mergeGeos([l, r]);
+})();
 function makeCar(color, style) {
+  style = style || 'sedan';
   const g = new THREE.Group();
-  const paint = new THREE.MeshPhongMaterial({ color, shininess: 70, specular: 0x555555 });
-  const body = new THREE.Mesh(unitBox, paint);
-  body.scale.set(1.85, 0.62, 4.3); body.position.y = 0.62; body.castShadow = true; g.add(body);
-  const lower = new THREE.Mesh(unitBox, paint);
-  lower.scale.set(1.9, 0.3, 4.36); lower.position.y = 0.36; g.add(lower);
-  if (style === 'van') {
-    const cab = new THREE.Mesh(unitBox, glassMat); cab.scale.set(1.7, 0.85, 3.9); cab.position.set(0, 1.32, -0.1); cab.castShadow = true; g.add(cab);
-    const roof = new THREE.Mesh(unitBox, paint); roof.scale.set(1.78, 0.09, 4.0); roof.position.set(0, 1.79, -0.1); g.add(roof);
-  } else if (style === 'pickup') {
-    const cab = new THREE.Mesh(unitBox, glassMat); cab.scale.set(1.66, 0.6, 1.5); cab.position.set(0, 1.2, 0.85); cab.castShadow = true; g.add(cab);
-    const roof = new THREE.Mesh(unitBox, paint); roof.scale.set(1.72, 0.08, 1.6); roof.position.set(0, 1.54, 0.85); g.add(roof);
-    for (const sx of [-0.86, 0.86]) { const wall = new THREE.Mesh(unitBox, paint);
-      wall.scale.set(0.08, 0.42, 2.2); wall.position.set(sx, 1.1, -1.0); g.add(wall); }
-    const tail = new THREE.Mesh(unitBox, paint); tail.scale.set(1.8, 0.42, 0.08); tail.position.set(0, 1.1, -2.12); g.add(tail);
-  } else {
-    const cab = new THREE.Mesh(unitBox, glassMat); cab.scale.set(1.62, 0.55, 2.1); cab.position.set(0, 1.18, -0.2); cab.castShadow = true; g.add(cab);
-    const roof = new THREE.Mesh(unitBox, paint); roof.scale.set(1.68, 0.08, 2.0); roof.position.set(0, 1.5, -0.2); g.add(roof);
+  /* All painted + trim parts merge into ONE vertex-colored mesh; the
+     glass cabin stays its own mesh; headlights and taillights merge
+     into one mesh each — same mesh count as the plain version. */
+  const dark = 0x232527, chrome = 0xb9bfc6, plateC = 0xf2f3ee;
+  const P = [];
+  const box = (x, y, z, sx, sy, sz, col, euler) =>
+    P.push(colored(xg(unitBox, x, y, z, sx, sy, sz, euler), col === undefined ? color : col));
+  box(0, 0.62, 0, 1.85, 0.62, 4.3);                  // main shell
+  box(0, 0.36, 0, 1.9, 0.3, 4.36);                  // lower skirt
+  box(0, 0.42, 2.2, 1.92, 0.34, 0.14, dark);        // bumpers
+  box(0, 0.42, -2.2, 1.92, 0.34, 0.14, dark);
+  box(0, 0.74, 2.17, 1.06, 0.24, 0.05, dark);       // grille
+  box(0, 0.9, 2.17, 1.06, 0.045, 0.05, chrome);     // grille chrome strip
+  box(0, 0.45, 2.28, 0.66, 0.17, 0.03, plateC);     // licence plates
+  box(0, 0.45, -2.28, 0.66, 0.17, 0.03, plateC);
+  P.push(colored(xg(new THREE.CylinderGeometry(0.05, 0.05, 0.24, 8),
+    0.62, 0.3, -2.18, 1, 1, 1, new THREE.Euler(Math.PI / 2, 0, 0)), dark));   // exhaust
+  for (const s of [-1, 1]) {
+    box(s * 1.01, 1.24, 0.95, 0.17, 0.11, 0.05, dark);   // side mirrors
+    box(s * 0.94, 0.56, 0, 0.02, 0.05, 3.9, dark);       // side rubbing strip
   }
+  let cabGeo;
+  if (style === 'van') {
+    cabGeo = xg(unitBox, 0, 1.32, 1.28, 1.66, 0.85, 1.15);        // windshield only
+    box(0, 1.32, -0.62, 1.8, 0.95, 2.75);                         // panelled cargo box
+    box(0, 1.8, -0.1, 1.82, 0.08, 4.0);                           // roof (top = 1.84)
+    box(-0.8, 1.32, 1.78, 0.09, 0.9, 0.09, color, new THREE.Euler(-0.25, 0, 0));   // A-pillars
+    box(0.8, 1.32, 1.78, 0.09, 0.9, 0.09, color, new THREE.Euler(-0.25, 0, 0));
+    for (const s of [-1, 1]) box(s * 0.91, 1.05, -0.05, 0.02, 1.15, 0.03, dark);   // sliding-door seam
+  } else if (style === 'pickup') {
+    cabGeo = xg(unitBox, 0, 1.2, 0.85, 1.6, 0.6, 1.44);
+    box(0, 1.54, 0.85, 1.72, 0.08, 1.6);                          // roof (top = 1.58)
+    box(-0.86, 1.1, -1.0, 0.08, 0.42, 2.2);                       // open bed: walls + tailgate
+    box(0.86, 1.1, -1.0, 0.08, 0.42, 2.2);
+    box(0, 1.1, -2.12, 1.8, 0.42, 0.08);
+    box(0, 0.94, -1.05, 1.64, 0.03, 2.1, dark);                   // bed floor liner
+    box(-0.78, 1.2, 1.52, 0.09, 0.66, 0.09, color, new THREE.Euler(-0.3, 0, 0));   // pillars
+    box(0.78, 1.2, 1.52, 0.09, 0.66, 0.09, color, new THREE.Euler(-0.3, 0, 0));
+    box(-0.78, 1.2, 0.18, 0.09, 0.62, 0.09, color, new THREE.Euler(0.2, 0, 0));
+    box(0.78, 1.2, 0.18, 0.09, 0.62, 0.09, color, new THREE.Euler(0.2, 0, 0));
+  } else {
+    cabGeo = xg(unitBox, 0, 1.18, -0.2, 1.62, 0.55, 2.1);
+    const variant = (color >> 8) % 3;
+    box(0, 1.5, -0.2, 1.68, 0.08, 2.0, variant === 1 ? dark : color);   // roof (top = 1.54), sometimes two-tone
+    for (const s of [-1, 1]) {
+      box(s * 0.78, 1.18, 0.78, 0.09, 0.64, 0.09, color, new THREE.Euler(-0.32, 0, 0));  // A-pillar (raked)
+      box(s * 0.8, 1.18, -0.2, 0.07, 0.56, 0.07, color);                                   // B-pillar
+      box(s * 0.78, 1.18, -1.18, 0.09, 0.64, 0.09, color, new THREE.Euler(0.38, 0, 0));    // C-pillar (sloped)
+      box(s * 0.935, 0.8, -0.2, 0.02, 0.6, 0.03, dark);      // door seams
+      box(s * 0.935, 0.8, -1.28, 0.02, 0.6, 0.03, dark);
+      box(s * 0.935, 1.0, 0.45, 0.02, 0.04, 0.28, dark);     // door handles
+      box(s * 0.935, 1.0, -0.6, 0.02, 0.04, 0.28, dark);
+    }
+    if (variant === 2) {                                       // racing stripes
+      const sc = (color === 0xe8e4da || color === 0xc0c6cc) ? dark : 0xf2f2ee;
+      for (const s of [-1, 1]) {
+        box(s * 0.18, 0.945, 1.45, 0.3, 0.02, 1.3, sc);
+        box(s * 0.18, 1.555, -0.2, 0.3, 0.02, 1.9, sc);
+        box(s * 0.18, 0.945, -1.8, 0.3, 0.02, 0.7, sc);
+      }
+    } else if (variant === 0 && style === 'sedan') {           // occasional spoiler
+      box(0, 1.14, -2.02, 1.5, 0.05, 0.34, dark);
+      box(-0.55, 1.0, -2.02, 0.07, 0.24, 0.07, dark);
+      box(0.55, 1.0, -2.02, 0.07, 0.24, 0.07, dark);
+    }
+    if (style === 'taxi') for (const s of [-1, 1])             // checker band
+      for (let i = 0; i < 6; i++)
+        box(s * 0.945, 0.66, -1.55 + i * 0.62, 0.015, 0.15, 0.3, i % 2 ? dark : 0xf2f2ee);
+  }
+  const bodyM = new THREE.Mesh(mergeGeos(P), carPaintMat);
+  bodyM.castShadow = true; g.add(bodyM);
+  const cab = new THREE.Mesh(cabGeo, glassMat); cab.castShadow = true; g.add(cab);
   if (style === 'taxi') {
     const sign = new THREE.Mesh(unitBox, new THREE.MeshLambertMaterial({ color: 0xfff6d8, emissive: 0xffe9a0, emissiveIntensity: 0.55 }));
     sign.scale.set(0.62, 0.17, 0.34); sign.position.set(0, 1.62, -0.2); g.add(sign);
   }
+  const H = [], T = [];
   for (const sx of [-0.62, 0.62]) {
-    const hl = new THREE.Mesh(unitBox, headMat); hl.scale.set(0.3, 0.13, 0.06); hl.position.set(sx, 0.68, 2.16); g.add(hl);
-    const tl = new THREE.Mesh(unitBox, tailMat); tl.scale.set(0.3, 0.13, 0.06); tl.position.set(sx, 0.68, -2.16); g.add(tl);
+    H.push(xg(unitBox, sx, 0.7, 2.17, 0.36, 0.15, 0.06));
+    T.push(xg(unitBox, sx, 0.72, -2.17, 0.36, 0.14, 0.06));
   }
-  const wheels = [], wheelsF = [];
-  for (const [wx, wz, front] of [[-0.88, 1.38, 1], [0.88, 1.38, 1], [-0.88, -1.38, 0], [0.88, -1.38, 0]]) {
-    const pivot = new THREE.Group(); pivot.position.set(wx, 0.34, wz);
-    const w = new THREE.Mesh(wheelGeo, tireMat); w.rotation.z = Math.PI / 2; w.castShadow = true; pivot.add(w);
-    const hub = new THREE.Mesh(hubGeo, hubMat); hub.rotation.z = Math.PI / 2; pivot.add(hub);
-    g.add(pivot); wheels.push(w); if (front) wheelsF.push(pivot);
+  g.add(new THREE.Mesh(mergeGeos(H), headMat));
+  g.add(new THREE.Mesh(mergeGeos(T), tailMat));
+  const rear = new THREE.Mesh(rearAxleGeo, wheelMat);
+  rear.position.set(0, 0.34, -1.38); rear.castShadow = true; g.add(rear);
+  const wheels = [rear], wheelsF = [];
+  for (const sx of [-0.88, 0.88]) {
+    const pivot = new THREE.Group(); pivot.position.set(sx, 0.34, 1.38);
+    const w = new THREE.Mesh(wheelGeo, wheelMat); w.castShadow = true; pivot.add(w);
+    g.add(pivot); wheels.push(w); wheelsF.push(pivot);
   }
   scene.add(g);
-  return { g, heading: 0, v: 0, steer: 0, wheels, wheelsF, traffic: null, spin: 0 };
+  return { g, heading: 0, v: 0, steer: 0, wheels, wheelsF, traffic: null, spin: 0, style };
 }
 const carColors = [0xd94f3d, 0x3f7fbf, 0xe8e4da, 0x3fae8a, 0xe8b13c, 0x7a5fa0, 0xc0c6cc, 0x2f6db3, 0x8a8f94, 0xb03a5b];
 const parkedCars = [];
@@ -631,7 +789,7 @@ const allCars = parkedCars.concat(trafficCars);
    short shirt sleeves and skin forearms, trousers and shoes. ~1.83 units
    tall with the head ~1/7.5 of the height. Limbs pivot at the shoulder
    and hip so the walk/run swing reads from the joints. */
-const player = { pos: new THREE.Vector3(114, 0, 30), heading: -Math.PI / 2, vy: 0, jumpY: 0, grounded: true, phase: 0, lean: 0 };
+const player = { pos: new THREE.Vector3(114, 0, 30), heading: -Math.PI / 2, vy: 0, y: 0, grounded: true, standingOn: null, phase: 0, lean: 0, vx: 0, vz: 0, swing: 0 };
 {
   const skin = new THREE.MeshLambertMaterial({ color: 0xc98d64 });
   const shirt = new THREE.MeshLambertMaterial({ color: 0x1f8a8c });
@@ -688,8 +846,40 @@ function circleVsAABB(x, z, r, b) {
   const cx = clamp(x, b.minX, b.maxX), cz = clamp(z, b.minZ, b.maxZ);
   const dx = x - cx, dz = z - cz; return dx * dx + dz * dz < r * r;
 }
+/* ---- standable surfaces: car roofs (two levels — hood/trunk and the
+   cabin roof) and crate tops. A surface only counts as support when the
+   player's feet are already near or above it, so walking alongside a car
+   never snaps the player up onto it. ---- */
+function carRoofAt(car, lx, lz) {
+  if (Math.abs(lx) > 1.06 || Math.abs(lz) > 2.3) return -1;
+  const st = car.style;
+  if (st === 'van') return lz > 1.8 ? 0.93 : 1.84;
+  if (st === 'pickup') return (lz > 0.05 && lz < 1.65) ? 1.58 : 0.93;
+  return (lz > -1.3 && lz < 0.9) ? 1.54 : 0.93;   // sedan / taxi cabin zone
+}
+const _sup = { h: 0, car: null };
+function computeSupport(x, z, feetY) {
+  let h = groundY(x, z), on = null;
+  for (const car of allCars) {
+    const p = car.g.position;
+    const dx = x - p.x, dz = z - p.z;
+    const sin = Math.sin(car.heading), cos = Math.cos(car.heading);
+    const roof = carRoofAt(car, dx * cos - dz * sin, dx * sin + dz * cos);
+    if (roof < 0) continue;
+    const top = p.y + roof;
+    if (feetY >= top - 0.55 && top > h) { h = top; on = car; }
+  }
+  for (const b of colliders) {
+    if (b.top === undefined) continue;
+    if (x < b.minX - 0.12 || x > b.maxX + 0.12 || z < b.minZ - 0.12 || z > b.maxZ + 0.12) continue;
+    if (feetY >= b.top - 0.55 && b.top > h) { h = b.top; on = null; }
+  }
+  _sup.h = h; _sup.car = on;
+  return _sup;
+}
 function resolveFoot(pos, r) {
   for (const b of colliders) {
+    if (b.top !== undefined && player.y >= b.top - 0.35) continue;  // standing on this crate
     if (!circleVsAABB(pos.x, pos.z, r, b)) continue;
     const cx = clamp(pos.x, b.minX, b.maxX), cz = clamp(pos.z, b.minZ, b.maxZ);
     let dx = pos.x - cx, dz = pos.z - cz; const d2 = dx * dx + dz * dz;
@@ -706,8 +896,21 @@ function resolveFoot(pos, r) {
     if (d2 < rr2 * rr2 && d2 > 1e-8) { const d = Math.sqrt(d2); pos.x = c.x + dx / d * rr2; pos.z = c.z + dz / d * rr2; }
   }
   for (const car of allCars) {
-    const dx = pos.x - car.g.position.x, dz = pos.z - car.g.position.z, rr2 = r + 2.15, d2 = dx * dx + dz * dz;
-    if (d2 < rr2 * rr2 && d2 > 1e-8) { const d = Math.sqrt(d2); pos.x = car.g.position.x + dx / d * rr2; pos.z = car.g.position.z + dz / d * rr2; }
+    /* oriented-box push-out in the car's local frame; skipped entirely
+       while the player's feet are at/above the roof zone under them —
+       there the support logic owns the player (standing on the car) */
+    const p = car.g.position;
+    const dx = pos.x - p.x, dz = pos.z - p.z;
+    const sin = Math.sin(car.heading), cos = Math.cos(car.heading);
+    let lx = dx * cos - dz * sin, lz = dx * sin + dz * cos;
+    const HW = 0.95 + r, HL = 2.18 + r;
+    if (Math.abs(lx) >= HW || Math.abs(lz) >= HL) continue;
+    const roof = carRoofAt(car, clamp(lx, -1.06, 1.06), clamp(lz, -2.3, 2.3));
+    if (roof >= 0 && player.y >= p.y + roof - 0.45) continue;
+    const penX = HW - Math.abs(lx), penZ = HL - Math.abs(lz);
+    if (penX < penZ) lx = lx >= 0 ? HW : -HW; else lz = lz >= 0 ? HL : -HL;
+    pos.x = p.x + lx * cos + lz * sin;
+    pos.z = p.z - lx * sin + lz * cos;
   }
 }
 function carBlocked(x, z, r, self) {
@@ -800,8 +1003,15 @@ function nearestParked(maxD) {
   }
   return best;
 }
+/* ONE generous interaction radius shared by the prompt and the E action
+   (collision alone holds the player 2.65 from a car's centre, so the old
+   3.4 radius left a razor-thin working band): if the prompt is visible,
+   pressing E always works */
+const INTERACT_R = 4.0;
+function interactCar() { return nearestParked(INTERACT_R); }
 function enterCar(car) {
   mode = 'drive'; currentCar = car;
+  player.standingOn = null;
   player.g.visible = false;
   modeLabel.innerHTML = '&#x1F697; DRIVING';
   speedBox.classList.add('on');
@@ -812,7 +1022,8 @@ function exitCar() {
   const h = currentCar.heading;
   player.pos.set(currentCar.g.position.x + Math.cos(h) * 2.4, 0,
                  currentCar.g.position.z - Math.sin(h) * 2.4);
-  player.heading = h; player.jumpY = 0; player.vy = 0; player.grounded = true;
+  player.heading = h; player.y = groundY(player.pos.x, player.pos.z); player.vy = 0; player.grounded = true; player.standingOn = null;
+  player.vx = 0; player.vz = 0;
   resolveFoot(player.pos, 0.5);
   player.g.visible = true;
   currentCar.v = 0; currentCar = null; mode = 'foot';
@@ -821,8 +1032,9 @@ function exitCar() {
 }
 function toggleCar() {
   if (mode === 'drive') { exitCar(); return; }
-  const car = nearestParked(3.4);
-  if (car) enterCar(car);
+  const car = interactCar();
+  if (car) { enterCar(car); return; }
+  if (nearestParked(10)) showToast('No car in reach — walk closer to a parked car, then press E', 2000);
 }
 
 /* ---------------- per-frame updates ---------------- */
@@ -834,47 +1046,75 @@ function updateFoot(dt) {
   let iz = (driveKey('KeyW', 'ArrowUp') ? 1 : 0) - (driveKey('KeyS', 'ArrowDown') ? 1 : 0);
   let mx = viewX * iz + rightX * ix, mz = viewZ * iz + rightZ * ix;
   const len = Math.hypot(mx, mz);
-  const moving = len > 0.01;
-  if (moving) {
-    mx /= len; mz /= len;
-    const speed = (key('ShiftLeft') || key('ShiftRight')) ? 8.6 : 5.2;
-    player.heading = lerpAngle(player.heading, Math.atan2(mx, mz), 1 - Math.exp(-14 * dt));
+  const sprinting = key('ShiftLeft') || key('ShiftRight');
+  const topSpeed = sprinting ? 8.6 : 5.2;
+  let dvx = 0, dvz = 0;
+  if (len > 0.01) { dvx = mx / len * topSpeed; dvz = mz / len * topSpeed; }
+  /* velocity eases toward the desired velocity (~0.16 s ramp): starts and
+     stops are smooth instead of binary on/off, yet stay responsive; the
+     facing eases toward the actual direction of travel, never snaps */
+  const kv = 1 - Math.exp(-dt / 0.16);
+  player.vx += (dvx - player.vx) * kv;
+  player.vz += (dvz - player.vz) * kv;
+  const spd = Math.hypot(player.vx, player.vz);
+  if (spd > 0.02) {
+    if (spd > 0.4) player.heading = lerpAngle(player.heading, Math.atan2(player.vx, player.vz), 1 - Math.exp(-11 * dt));
     const ox = player.pos.x, oz = player.pos.z;
-    player.pos.x += mx * speed * dt; player.pos.z += mz * speed * dt;
+    player.pos.x += player.vx * dt; player.pos.z += player.vz * dt;
     if (player.pos.x > 160 && groundY(player.pos.x, player.pos.z) < 0.3) player.pos.x = ox;
     if (player.pos.z > 160 && groundY(player.pos.x, player.pos.z) < 0.3) player.pos.z = oz;
     player.pos.x = clamp(player.pos.x, -166, 236); player.pos.z = clamp(player.pos.z, -166, 166);
     resolveFoot(player.pos, 0.5);
-    player.phase += speed * dt * 1.9;
-    player.swing = Math.min(1, (player.swing || 0) + dt * 8);
-  } else {
-    player.swing = Math.max(0, (player.swing || 0) - dt * 8);
+    player.phase += spd * dt * 1.9;
   }
-  if (key('Space') && player.grounded) { player.vy = 5.4; player.grounded = false; }
+  /* limb swing amplitude tracks actual speed: a slow walk sways gently,
+     only a sprint swings fully — no more flailing at a stroll */
+  const swingTgt = clamp(spd / 7.5, 0, 1);
+  player.swing += (swingTgt - player.swing) * (1 - Math.exp(-9 * dt));
+  /* vertical: feet height is absolute and the support underfoot is the
+     ground, a crate top, or a car roof. Walking off an edge starts a
+     fall; landing snaps to the support. The jump (apex ~1.78) clears a
+     sedan roof, so cars can be boarded GTA-style from the ground. */
+  const sup = computeSupport(player.pos.x, player.pos.z, player.y);
+  if (player.grounded) {
+    if (key('Space')) { player.vy = 7.3; player.grounded = false; player.standingOn = null; }
+    else if (player.y > sup.h + 0.03) { player.grounded = false; player.vy = 0; player.standingOn = null; }
+    else { player.y = sup.h; player.standingOn = sup.car; }
+  }
   if (!player.grounded) {
-    player.jumpY += player.vy * dt; player.vy -= 15 * dt;
-    if (player.jumpY <= 0) { player.jumpY = 0; player.vy = 0; player.grounded = true; }
+    player.vy -= 15 * dt; player.y += player.vy * dt;
+    if (player.vy <= 0) {
+      const s2 = computeSupport(player.pos.x, player.pos.z, player.y);
+      if (player.y <= s2.h) { player.y = s2.h; player.vy = 0; player.grounded = true; player.standingOn = s2.car; }
+    }
   }
-  const sw = Math.sin(player.phase) * (player.swing || 0);
+  const sw = Math.sin(player.phase) * player.swing;
   player.legL.rotation.x = sw * 0.62; player.legR.rotation.x = -sw * 0.62;
   player.armL.rotation.x = -sw * 0.5; player.armR.rotation.x = sw * 0.5;
-  /* body language: gentle bob at stride frequency, forward lean with speed */
-  const sprinting = moving && (key('ShiftLeft') || key('ShiftRight'));
-  player.lean = lerp(player.lean, (player.swing || 0) * (sprinting ? 0.15 : 0.05), 1 - Math.exp(-8 * dt));
+  /* body language: stride bob plus a whisper of lateral sway, lean grows
+     with speed */
+  player.lean = lerp(player.lean, player.swing * (sprinting && spd > 1 ? 0.15 : 0.05), 1 - Math.exp(-8 * dt));
   player.body.rotation.x = player.lean;
-  player.body.position.y = Math.abs(Math.sin(player.phase)) * 0.05 * (player.swing || 0);
-  player.g.position.set(player.pos.x, groundY(player.pos.x, player.pos.z) + player.jumpY, player.pos.z);
+  player.body.rotation.z = Math.sin(player.phase) * 0.03 * player.swing;
+  player.body.position.y = Math.abs(Math.sin(player.phase)) * 0.05 * player.swing;
+  player.body.position.x = Math.sin(player.phase) * 0.022 * player.swing;
+  player.g.position.set(player.pos.x, player.y, player.pos.z);
   player.g.rotation.y = player.heading;
-  /* E prompt */
-  promptEl.classList.toggle('on', !!nearestParked(3.4));
+  /* E prompt — same helper and radius as the E action itself */
+  promptEl.classList.toggle('on', !!interactCar());
 }
 function updateDrive(dt) {
   const car = currentCar, p = car.g.position;
   _prev.copy(p);
   const steerIn = (driveKey('KeyA', 'ArrowLeft') ? 1 : 0) - (driveKey('KeyD', 'ArrowRight') ? 1 : 0);
-  car.steer = lerp(car.steer, steerIn * 0.5, 1 - Math.exp(-10 * dt));
-  if (driveKey('KeyW', 'ArrowUp')) car.v += (car.v < 0 ? 26 : 15) * dt;
-  if (driveKey('KeyS', 'ArrowDown')) car.v -= (car.v > 0.5 ? 26 : 11) * dt;
+  /* more steering bite at low speed, calmer at speed; the wheel eases in
+     and returns smoothly (a touch faster on return) instead of snapping */
+  const maxSteer = lerp(0.62, 0.4, clamp(Math.abs(car.v) / 33, 0, 1));
+  car.steer = lerp(car.steer, steerIn * maxSteer, 1 - Math.exp(-(steerIn !== 0 ? 11 : 13) * dt));
+  /* stronger throttle with a gentle taper near top speed (top speed
+     itself is unchanged — it is set by the clamp and drag below) */
+  if (driveKey('KeyW', 'ArrowUp')) car.v += (car.v < 0 ? 30 : 21 * (1 - 0.35 * Math.max(0, car.v) / 33)) * dt;
+  if (driveKey('KeyS', 'ArrowDown')) car.v -= (car.v > 0.5 ? 30 : 14) * dt;
   car.v -= car.v * (driveKey('KeyW', 'ArrowUp') || driveKey('KeyS', 'ArrowDown') ? 0.3 : 0.85) * dt;
   car.v = clamp(car.v, -9, 33);
   if (!driveKey('KeyW', 'ArrowUp') && !driveKey('KeyS', 'ArrowDown') && Math.abs(car.v) < 0.05) car.v = 0;
@@ -895,6 +1135,7 @@ function updateTraffic(dt) {
   const pp = mode === 'drive' ? currentCar.g.position : player.g.position;
   for (const car of trafficCars) {
     const t = car.traffic, p = car.g.position;
+    const ox = p.x, oz = p.z, oh = car.heading;
     let wp = t.wp[t.wi];
     let dx = wp.x - p.x, dz = wp.z - p.z;
     if (dx * dx + dz * dz < 49) { t.wi = (t.wi + 1) % 4; wp = t.wp[t.wi]; dx = wp.x - p.x; dz = wp.z - p.z; }
@@ -911,6 +1152,17 @@ function updateTraffic(dt) {
     const rate = target < car.v ? 16 : 6;
     car.v += clamp(target - car.v, -rate * dt, rate * dt);
     p.x += fx * car.v * dt; p.z += fz * car.v * dt; p.y = groundY(p.x, p.z);
+    if (player.standingOn === car && mode === 'foot') {
+      /* ride the roof: translate with the car and rotate around it; if a
+         sharp turn leaves the player outside the footprint, the support
+         logic next frame simply lets them slide off and fall */
+      const dh = car.heading - oh;
+      let rx = player.pos.x - ox, rz = player.pos.z - oz;
+      if (dh) { const c = Math.cos(dh), s = Math.sin(dh);
+        const nx = rx * c + rz * s, nz = -rx * s + rz * c; rx = nx; rz = nz;
+        player.heading += dh; }
+      player.pos.x = p.x + rx; player.pos.z = p.z + rz;
+    }
     car.g.rotation.y = car.heading;
     car.spin += car.v * dt / 0.34;
     for (const w of car.wheels) w.rotation.x = car.spin;
@@ -922,8 +1174,8 @@ function updateTraffic(dt) {
 function updateCamera(dt) {
   const target = mode === 'drive' ? currentCar.g.position : player.g.position;
   const ty = mode === 'drive' ? 1.3 : 1.7;
-  if (mode === 'drive' && performance.now() - lastDragT > 2200)
-    camYaw = lerpAngle(camYaw, currentCar.heading + Math.PI, 1 - Math.exp(-2.6 * dt));
+  if (mode === 'drive' && performance.now() - lastDragT > 1300)
+    camYaw = lerpAngle(camYaw, currentCar.heading + Math.PI, 1 - Math.exp(-3.8 * dt));
   camDist = lerp(camDist, mode === 'drive' ? Math.max(camDist, 10.5) : camDist, 1 - Math.exp(-4 * dt));
   const cp = Math.cos(camPitch), sp = Math.sin(camPitch);
   _desired.set(target.x + Math.sin(camYaw) * cp * camDist,
@@ -961,6 +1213,11 @@ function animate() {
     engGain.gain.value = driving ? 0.045 + Math.min(0.05, Math.abs(currentCar.v) * 0.0022) : 0;
     if (engOsc) engOsc.frequency.value = driving ? 55 + Math.abs(currentCar.v) * 4.4 : 55;
   }
+  /* keep the tight shadow frustum centred on the action */
+  const focus = mode === 'drive' ? currentCar.g.position : player.g.position;
+  sun.position.set(focus.x - 135, 84, focus.z - 60);
+  sun.target.position.set(focus.x, 0, focus.z);
+  sun.target.updateMatrixWorld();
   renderer.render(scene, camera);
   if (!readyFlag) {
     readyFlag = true;
@@ -988,6 +1245,19 @@ window.__solano = {
   enterNearestCar: (maxD) => { const c = nearestParked(maxD || 18); if (c) { enterCar(c); return true; } return false; },
   exitCar: () => { if (mode === 'drive') exitCar(); },
   setKey: (code, down) => { keys[code] = !!down; },
+  feetY: () => player.y,
+  grounded: () => player.grounded,
+  standingOnCar: () => !!player.standingOn,
+  promptOn: () => promptEl.classList.contains('on'),
+  debugPlace: (x, z, y) => {           // test hook: drop the player somewhere
+    player.pos.x = x; player.pos.z = z; player.vx = 0; player.vz = 0; player.vy = 0;
+    if (y === undefined) { const s = computeSupport(x, z, 99); player.y = s.h; player.grounded = true; player.standingOn = s.car; }
+    else { player.y = y; player.grounded = false; player.standingOn = null; }
+    player.g.position.set(x, player.y, z);
+    return player.y;
+  },
+  debugCars: () => allCars.map(c => ({ x: c.g.position.x, z: c.g.position.z, heading: c.heading,
+                                        v: c.v, traffic: !!c.traffic, style: c.style })),
   info: () => ({ buildings: buildingCount, parked: parkedCars.length, traffic: trafficCars.length,
                  drawCalls: renderer.info.render.calls, triangles: renderer.info.render.triangles })
 };
