@@ -844,11 +844,13 @@ const allCars = parkedCars.concat(trafficCars);
 
 /* ---------------- player character ----------------
    Low-poly person built from rounded forms: sphere head under a curved
-   red cap, tapered torso (shoulders wider than hips), capsule limbs with
-   short shirt sleeves and skin forearms, trousers and shoes. ~1.83 units
-   tall with the head ~1/7.5 of the height. Limbs pivot at the shoulder
-   and hip so the walk/run swing reads from the joints. */
-const player = { pos: new THREE.Vector3(114, 0, 30), heading: -Math.PI / 2, vy: 0, y: 0, grounded: true, standingOn: null, phase: 0, lean: 0, vx: 0, vz: 0, swing: 0, squashT: 0, squashAmt: 0 };
+   red cap, tapered torso (shoulders wider than hips), two-segment limbs
+   (thigh+shin, upper arm+forearm) with short shirt sleeves and skin
+   forearms, trousers and shoes. ~1.83 units tall with the head ~1/7.5
+   of the height. Pelvis and torso sit in separate waist-pivot groups so
+   hips and shoulders can counter-rotate; every limb joint is a real
+   pivot so the gait bends knees and elbows instead of swinging sticks. */
+const player = { pos: new THREE.Vector3(114, 0, 30), heading: -Math.PI / 2, vy: 0, y: 0, grounded: true, standingOn: null, phase: 0, lean: 0, vx: 0, vz: 0, swing: 0, squashT: 0, squashAmt: 0, mw: 0, airW: 0 };
 {
   const skin = new THREE.MeshLambertMaterial({ color: 0xc98d64 });
   const shirt = new THREE.MeshLambertMaterial({ color: 0x1f8a8c });
@@ -863,32 +865,49 @@ const player = { pos: new THREE.Vector3(114, 0, 30), heading: -Math.PI / 2, vy: 
     const m = new THREE.Mesh(geo, mat);
     m.position.set(x, y, z); m.castShadow = true; parent.add(m); return m;
   }
+  /* pelvis and torso live in their own waist-height pivot groups so the
+     hips and shoulders can counter-rotate against each other; child
+     offsets below are relative to each group's pivot */
+  const pelvisG = new THREE.Group(); pelvisG.position.y = 0.94; body.add(pelvisG); player.pelvis = pelvisG;
+  const torsoG = new THREE.Group(); torsoG.position.y = 0.98; body.add(torsoG); player.torso = torsoG;
   /* pelvis + tapered torso, flattened front-to-back */
-  part(body, new THREE.CylinderGeometry(0.148, 0.13, 0.2, 12), pants, 0, 0.96, 0).scale.set(1.12, 1, 0.8);
-  part(body, new THREE.CylinderGeometry(0.19, 0.136, 0.56, 14), shirt, 0, 1.24, 0).scale.set(1.18, 1, 0.76);
-  part(body, new THREE.CylinderGeometry(0.08, 0.095, 0.08, 10), shirt, 0, 1.52, 0);   // collar
-  part(body, new THREE.CylinderGeometry(0.05, 0.056, 0.1, 10), skin, 0, 1.55, 0);     // neck
-  /* legs: trouser capsules swinging from the hip, dark shoes */
+  part(pelvisG, new THREE.CylinderGeometry(0.148, 0.13, 0.2, 12), pants, 0, 0.02, 0).scale.set(1.12, 1, 0.8);
+  part(torsoG, new THREE.CylinderGeometry(0.19, 0.136, 0.56, 14), shirt, 0, 0.26, 0).scale.set(1.18, 1, 0.76);
+  part(torsoG, new THREE.CylinderGeometry(0.08, 0.095, 0.08, 10), shirt, 0, 0.54, 0);   // collar
+  part(torsoG, new THREE.CylinderGeometry(0.05, 0.056, 0.1, 10), skin, 0, 0.57, 0);     // neck
+  /* legs: thigh from the hip, shin from the knee, shoe on an ankle pivot —
+     two segments, so the knee bends and the foot rides a lift arc instead
+     of orbiting the hip on a stick. Sole still lands ~0.91 below the hip. */
   function makeLeg(side) {
-    const grp = new THREE.Group(); grp.position.set(0.105 * side, 0.94, 0); body.add(grp);
-    part(grp, new THREE.CapsuleGeometry(0.08, 0.66, 4, 12), pants, 0, -0.43, 0);
-    part(grp, new THREE.BoxGeometry(0.11, 0.07, 0.27), shoeM, 0, -0.875, 0.04);
-    return grp;
+    const hip = new THREE.Group(); hip.position.set(0.105 * side, 0, 0); pelvisG.add(hip);
+    part(hip, new THREE.CapsuleGeometry(0.082, 0.27, 4, 12), pants, 0, -0.217, 0);
+    const knee = new THREE.Group(); knee.position.y = -0.42; hip.add(knee);
+    part(knee, new THREE.CapsuleGeometry(0.06, 0.27, 4, 12), pants, 0, -0.20, 0);
+    const foot = new THREE.Group(); foot.position.y = -0.40; knee.add(foot);
+    part(foot, new THREE.BoxGeometry(0.11, 0.07, 0.27), shoeM, 0, -0.045, 0.045);
+    return { hip, knee, foot };
   }
-  player.legL = makeLeg(-1); player.legR = makeLeg(1);
-  /* arms: short shirt sleeve, skin forearm and hand, hanging to mid-thigh */
+  const legL = makeLeg(-1), legR = makeLeg(1);
+  player.legL = legL.hip; player.legR = legR.hip;
+  player.kneeL = legL.knee; player.kneeR = legR.knee;
+  player.footL = legL.foot; player.footR = legR.foot;
+  /* arms: upper arm (shirt sleeve) from the shoulder, forearm (skin) and
+     hand from the elbow — two segments so the elbow can bend */
   function makeArm(side) {
-    const grp = new THREE.Group(); grp.position.set(0.25 * side, 1.45, 0); body.add(grp);
-    part(grp, new THREE.CapsuleGeometry(0.06, 0.18, 4, 10), shirt, 0, -0.15, 0);
-    part(grp, new THREE.CapsuleGeometry(0.047, 0.17, 4, 10), skin, 0, -0.42, 0);
-    part(grp, new THREE.SphereGeometry(0.055, 10, 8), skin, 0, -0.6, 0);
-    return grp;
+    const sh = new THREE.Group(); sh.position.set(0.25 * side, 0.47, 0); torsoG.add(sh);
+    part(sh, new THREE.CapsuleGeometry(0.06, 0.17, 4, 10), shirt, 0, -0.145, 0);
+    const el = new THREE.Group(); el.position.y = -0.28; sh.add(el);
+    part(el, new THREE.CapsuleGeometry(0.047, 0.16, 4, 10), skin, 0, -0.125, 0);
+    part(el, new THREE.SphereGeometry(0.055, 10, 8), skin, 0, -0.29, 0);
+    return { sh, el };
   }
-  player.armL = makeArm(-1); player.armR = makeArm(1);
-  part(body, new THREE.SphereGeometry(0.072, 10, 8), shirt, -0.25, 1.45, 0);  // shoulder caps
-  part(body, new THREE.SphereGeometry(0.072, 10, 8), shirt, 0.25, 1.45, 0);
+  const armL = makeArm(-1), armR = makeArm(1);
+  player.armL = armL.sh; player.armR = armR.sh;
+  player.elbowL = armL.el; player.elbowR = armR.el;
+  part(torsoG, new THREE.SphereGeometry(0.072, 10, 8), shirt, -0.25, 0.47, 0);  // shoulder caps
+  part(torsoG, new THREE.SphereGeometry(0.072, 10, 8), shirt, 0.25, 0.47, 0);
   /* head: sphere with simple eyes; red cap as a flattened dome + curved brim */
-  const headG = new THREE.Group(); headG.position.y = 1.58; body.add(headG);
+  const headG = new THREE.Group(); headG.position.y = 0.60; torsoG.add(headG); player.head = headG;
   part(headG, new THREE.SphereGeometry(0.12, 18, 14), skin, 0, 0.13, 0);
   part(headG, new THREE.SphereGeometry(0.016, 8, 6), darkM, -0.045, 0.15, 0.11);
   part(headG, new THREE.SphereGeometry(0.016, 8, 6), darkM, 0.045, 0.15, 0.11);
@@ -1127,7 +1146,9 @@ function updateFoot(dt) {
     if (player.pos.z > 160 && groundY(player.pos.x, player.pos.z) < 0.3) player.pos.z = oz;
     player.pos.x = clamp(player.pos.x, -166, 236); player.pos.z = clamp(player.pos.z, -166, 166);
     resolveFoot(player.pos, 0.5);
-    player.phase += spd * dt * 1.9;
+    /* cadence grows with speed, but the per-speed rate eases off as the
+       stride lengthens toward a sprint, so feet don't scurry */
+    player.phase += spd * dt * lerp(2.05, 1.65, clamp(spd / 8.6, 0, 1));
   }
   /* limb swing amplitude tracks actual speed: a slow walk sways gently,
      only a sprint swings fully — no more flailing at a stroll */
@@ -1160,16 +1181,68 @@ function updateFoot(dt) {
     const sq = player.squashAmt * (player.squashT / 0.16);
     player.body.scale.set(1 + sq * 0.55, 1 - sq, 1 + sq * 0.55);
   } else if (player.body.scale.y !== 1) player.body.scale.set(1, 1, 1);
-  const sw = Math.sin(player.phase) * player.swing;
-  player.legL.rotation.x = sw * 0.62; player.legR.rotation.x = -sw * 0.62;
-  player.armL.rotation.x = -sw * 0.5; player.armR.rotation.x = sw * 0.5;
-  /* body language: stride bob plus a whisper of lateral sway, lean grows
-     with speed */
-  player.lean = lerp(player.lean, player.swing * (sprinting && spd > 1 ? 0.15 : 0.05), 1 - Math.exp(-8 * dt));
-  player.body.rotation.x = player.lean;
-  player.body.rotation.z = Math.sin(player.phase) * 0.03 * player.swing;
-  player.body.position.y = Math.abs(Math.sin(player.phase)) * 0.05 * player.swing;
-  player.body.position.x = Math.sin(player.phase) * 0.022 * player.swing;
+  /* ---- procedural gait on jointed limbs ----
+     Per leg, phase u (the right leg runs at u + π): the hip swings as a
+     sine; the knee bends on a −cos curve, peaking mid-swing (u = π, leg
+     passing under the body) and straight at plant and toe-off, so the
+     foot lifts through an arc instead of dragging on a stick; the ankle
+     plantar-flexes at push-off. Arms swing against the same-side leg
+     with an elbow bend that deepens toward a sprint. Pelvis and torso
+     counter-rotate a few degrees; the head counter-pitches and
+     counter-yaws to stay level. All of it is weighted by mw (an eased
+     move weight) so stopping glides into a gentle breathing idle
+     instead of freezing mid-stride. The bob lives in the body group —
+     the physics origin (feet at player.y) never moves. */
+  const spdN = clamp(spd / 8.6, 0, 1);
+  player.mw += ((player.grounded ? clamp(spd / 1.6, 0, 1) : player.mw) - player.mw) * (1 - Math.exp(-dt / 0.16));
+  player.airW += ((player.grounded ? 0 : 1) - player.airW) * (1 - Math.exp(-dt / 0.12));
+  const mw = player.mw, iw = 1 - mw, ph = player.phase, sPh = Math.sin(ph);
+  const hipAmp = (0.30 + spd * 0.05) * mw;                 // stride length grows with speed
+  const kneeAmp = clamp(0.55 + spd * 0.075, 0.55, 1.2) * mw;
+  const armAmp = hipAmp * lerp(0.78, 0.55, spdN);
+  const elbowBase = lerp(0.14, 0.95, spdN * spdN) * mw + 0.14 * iw;
+  function poseLeg(hip, knee, foot, u) {
+    const s = Math.sin(u), c = Math.cos(u);
+    hip.rotation.x = hipAmp * s;
+    knee.rotation.x = 0.04 * mw + kneeAmp * Math.pow(Math.max(0, -c), 1.3);
+    foot.rotation.x = mw * (0.32 * Math.pow(Math.max(0, s), 1.5) + 0.12 * Math.max(0, -c));
+  }
+  poseLeg(player.legL, player.kneeL, player.footL, ph);
+  poseLeg(player.legR, player.kneeR, player.footR, ph + Math.PI);
+  function poseArm(sh, el, u) {           // u = same-side leg phase; the arm opposes it
+    sh.rotation.x = -armAmp * Math.sin(u);
+    el.rotation.x = -(elbowBase + 0.16 * Math.max(0, Math.sin(u)) * (0.4 + spdN) * mw);
+  }
+  poseArm(player.armL, player.elbowL, ph);
+  poseArm(player.armR, player.elbowR, ph + Math.PI);
+  /* airborne: settle into a loose tucked jump pose over the gait */
+  if (player.airW > 0.01) {
+    const a = player.airW;
+    player.legL.rotation.x = lerp(player.legL.rotation.x, -0.38, a);
+    player.kneeL.rotation.x = lerp(player.kneeL.rotation.x, 0.55, a);
+    player.legR.rotation.x = lerp(player.legR.rotation.x, 0.30, a);
+    player.kneeR.rotation.x = lerp(player.kneeR.rotation.x, 0.22, a);
+    player.footL.rotation.x = lerp(player.footL.rotation.x, 0.15, a);
+    player.footR.rotation.x = lerp(player.footR.rotation.x, 0.15, a);
+    player.armL.rotation.z = lerp(player.armL.rotation.z, -0.18, a);
+    player.armR.rotation.z = lerp(player.armR.rotation.z, 0.18, a);
+  } else if (player.armL.rotation.z !== 0) { player.armL.rotation.z = 0; player.armR.rotation.z = 0; }
+  /* counter-rotation, torso language, stable head */
+  const twist = 0.10 * mw;
+  player.pelvis.rotation.y = -twist * sPh;
+  player.pelvis.rotation.z = -0.02 * sPh * mw;
+  player.torso.rotation.y = twist * sPh * 0.85;
+  player.torso.rotation.z = 0.045 * sPh * mw;
+  player.lean = lerp(player.lean, (0.03 + 0.12 * spdN) * mw, 1 - Math.exp(-8 * dt));
+  const breathe = Math.sin(elapsed * 1.5) * iw;
+  player.torso.rotation.x = player.lean + breathe * 0.012;
+  player.head.rotation.x = -player.lean * 0.72 + breathe * 0.006;
+  player.head.rotation.y = -twist * sPh * 0.5;
+  player.body.rotation.x = player.lean * 0.3;
+  player.body.rotation.z = 0.008 * Math.sin(elapsed * 0.4) * iw;
+  /* bob phased to footfalls: two dips per cycle, at each plant */
+  player.body.position.y = Math.cos(ph * 2) * (0.030 + 0.018 * spdN) * mw + Math.sin(elapsed * 1.5) * 0.006 * iw;
+  player.body.position.x = sPh * 0.02 * mw + 0.012 * Math.sin(elapsed * 0.4) * iw;
   player.g.position.set(player.pos.x, player.y, player.pos.z);
   player.g.rotation.y = player.heading;
   /* E prompt — same helper and radius as the E action itself */
@@ -1784,6 +1857,8 @@ window.__solano = {
   exitCar: () => { if (mode === 'drive') exitCar(); },
   setKey: (code, down) => { keys[code] = !!down; },
   feetY: () => player.y,
+  gait: () => ({ phase: Math.round(player.phase * 100) / 100, mw: Math.round(player.mw * 100) / 100,
+                 spd: Math.round(Math.hypot(player.vx, player.vz) * 100) / 100 }),
   grounded: () => player.grounded,
   standingOnCar: () => !!player.standingOn,
   promptOn: () => promptEl.classList.contains('on'),
