@@ -195,6 +195,7 @@ function ri(a, b) { return Math.floor(rr(a, b + 1)); }
 function pick(arr) { return arr[Math.floor(rnd() * arr.length)]; }
 function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
 function lerp(a, b, t) { return a + (b - a) * t; }
+function sstep(a, b, x) { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); }
 function lerpAngle(a, b, t) { let d = (b - a) % (Math.PI * 2);
   if (d > Math.PI) d -= Math.PI * 2; if (d < -Math.PI) d += Math.PI * 2; return a + d * t; }
 
@@ -850,7 +851,7 @@ const allCars = parkedCars.concat(trafficCars);
    of the height. Pelvis and torso sit in separate waist-pivot groups so
    hips and shoulders can counter-rotate; every limb joint is a real
    pivot so the gait bends knees and elbows instead of swinging sticks. */
-const player = { pos: new THREE.Vector3(114, 0, 30), heading: -Math.PI / 2, vy: 0, y: 0, grounded: true, standingOn: null, phase: 0, lean: 0, vx: 0, vz: 0, swing: 0, squashT: 0, squashAmt: 0, mw: 0, airW: 0 };
+const player = { pos: new THREE.Vector3(114, 0, 30), heading: -Math.PI / 2, vy: 0, y: 0, grounded: true, standingOn: null, phase: 0, lean: 0, vx: 0, vz: 0, swing: 0, squashT: 0, squashAmt: 0, mw: 0, airW: 0, runW: 0, _gait: null };
 {
   const skin = new THREE.MeshLambertMaterial({ color: 0xc98d64 });
   const shirt = new THREE.MeshLambertMaterial({ color: 0x1f8a8c });
@@ -1147,8 +1148,8 @@ function updateFoot(dt) {
     player.pos.x = clamp(player.pos.x, -166, 236); player.pos.z = clamp(player.pos.z, -166, 166);
     resolveFoot(player.pos, 0.5);
     /* cadence grows with speed, but the per-speed rate eases off as the
-       stride lengthens toward a sprint, so feet don't scurry */
-    player.phase += spd * dt * lerp(2.05, 1.65, clamp(spd / 8.6, 0, 1));
+       run factor rises and the stride lengthens, so feet don't scurry */
+    player.phase += spd * dt * lerp(1.9, 1.48, sstep(5.4, 8.2, spd));
   }
   /* limb swing amplitude tracks actual speed: a slow walk sways gently,
      only a sprint swings fully — no more flailing at a stroll */
@@ -1196,25 +1197,39 @@ function updateFoot(dt) {
   const spdN = clamp(spd / 8.6, 0, 1);
   player.mw += ((player.grounded ? clamp(spd / 1.6, 0, 1) : player.mw) - player.mw) * (1 - Math.exp(-dt / 0.16));
   player.airW += ((player.grounded ? 0 : 1) - player.airW) * (1 - Math.exp(-dt / 0.12));
+  /* run factor: 0 at a walk, 1 at a full sprint. The pose is BLENDED
+     between two qualitatively different gaits on this factor — a walk is
+     upright with hanging arms and a gentle knee lift, a run leans hard
+     into the stride with driving thighs, a deep heel-kick fold, and
+     elbows bent ~90° pumping tight to the torso. Merely scaling one
+     curve's amplitudes read as the same pose at two tempos (playtest
+     feedback), so every channel below lerps between distinct walk and
+     run values instead. */
+  player.runW += ((player.grounded ? sstep(5.4, 8.2, spd) : player.runW) - player.runW) * (1 - Math.exp(-dt / 0.18));
   const mw = player.mw, iw = 1 - mw, ph = player.phase, sPh = Math.sin(ph);
-  const hipAmp = (0.30 + spd * 0.05) * mw;                 // stride length grows with speed
-  const kneeAmp = clamp(0.55 + spd * 0.075, 0.55, 1.2) * mw;
-  const armAmp = hipAmp * lerp(0.78, 0.55, spdN);
-  const elbowBase = lerp(0.14, 0.95, spdN * spdN) * mw + 0.14 * iw;
+  const runW = player.runW;
+  const hipAmp = lerp(0.30 + spd * 0.05, 1.02, runW) * mw;   // run thighs swing far wider
+  const hipBias = -0.18 * runW * mw;          // ...and the swing shifts forward: front thigh drives up toward horizontal, less time trailing
+  const kneeAmp = lerp(clamp(0.55 + spd * 0.075, 0.55, 1.2), 2.05, runW) * mw;  // run folds the shin deep (heel toward butt)
+  const armAmp = hipAmp * lerp(0.72, 0.70, runW);
+  const elbowBase = lerp(0.22, 1.45, runW) * mw + 0.14 * iw; // walk: near-straight hanging arm; run: ~90° pump
+  const elbowPulse = lerp(0.10, 0.38, runW) * mw;
   function poseLeg(hip, knee, foot, u) {
     const s = Math.sin(u), c = Math.cos(u);
-    hip.rotation.x = hipAmp * s;
+    hip.rotation.x = hipAmp * s + hipBias;
     knee.rotation.x = 0.04 * mw + kneeAmp * Math.pow(Math.max(0, -c), 1.3);
-    foot.rotation.x = mw * (0.32 * Math.pow(Math.max(0, s), 1.5) + 0.12 * Math.max(0, -c));
+    foot.rotation.x = mw * (lerp(0.32, 0.5, runW) * Math.pow(Math.max(0, s), 1.5) + 0.12 * Math.max(0, -c));
   }
   poseLeg(player.legL, player.kneeL, player.footL, ph);
   poseLeg(player.legR, player.kneeR, player.footR, ph + Math.PI);
-  function poseArm(sh, el, u) {           // u = same-side leg phase; the arm opposes it
+  function poseArm(sh, el, u, side) {       // u = same-side leg phase; the arm opposes it
     sh.rotation.x = -armAmp * Math.sin(u);
-    el.rotation.x = -(elbowBase + 0.16 * Math.max(0, Math.sin(u)) * (0.4 + spdN) * mw);
+    sh.rotation.z = -side * 0.09 * runW * mw;   // elbows tuck in toward the torso at a run
+    el.rotation.x = -(elbowBase + elbowPulse * Math.max(0, Math.sin(u)));
   }
-  poseArm(player.armL, player.elbowL, ph);
-  poseArm(player.armR, player.elbowR, ph + Math.PI);
+  poseArm(player.armL, player.elbowL, ph, -1);
+  poseArm(player.armR, player.elbowR, ph + Math.PI, 1);
+  player._gait = { runW, hipAmp, kneeAmp, elbowBase, armAmp };
   /* airborne: settle into a loose tucked jump pose over the gait */
   if (player.airW > 0.01) {
     const a = player.airW;
@@ -1226,22 +1241,31 @@ function updateFoot(dt) {
     player.footR.rotation.x = lerp(player.footR.rotation.x, 0.15, a);
     player.armL.rotation.z = lerp(player.armL.rotation.z, -0.18, a);
     player.armR.rotation.z = lerp(player.armR.rotation.z, 0.18, a);
-  } else if (player.armL.rotation.z !== 0) { player.armL.rotation.z = 0; player.armR.rotation.z = 0; }
+  }
+  /* (no arm-z reset needed on landing: poseArm re-owns rotation.z every frame) */
   /* counter-rotation, torso language, stable head */
-  const twist = 0.10 * mw;
+  const twist = lerp(0.10, 0.16, runW) * mw;
   player.pelvis.rotation.y = -twist * sPh;
   player.pelvis.rotation.z = -0.02 * sPh * mw;
   player.torso.rotation.y = twist * sPh * 0.85;
   player.torso.rotation.z = 0.045 * sPh * mw;
-  player.lean = lerp(player.lean, (0.03 + 0.12 * spdN) * mw, 1 - Math.exp(-8 * dt));
+  /* torso pitch is a headline walk/run difference: near-upright at a
+     walk (~0.04 rad), a hard forward lean at a sprint (~0.32 rad) */
+  player.lean = lerp(player.lean, lerp(0.035, 0.32, runW) * mw, 1 - Math.exp(-8 * dt));
   const breathe = Math.sin(elapsed * 1.5) * iw;
   player.torso.rotation.x = player.lean + breathe * 0.012;
-  player.head.rotation.x = -player.lean * 0.72 + breathe * 0.006;
+  /* the head counter-pitches less at a run and tucks slightly forward,
+     instead of staying perfectly level like at a walk */
+  player.head.rotation.x = -player.lean * lerp(0.72, 0.45, runW) + 0.05 * runW + breathe * 0.006;
   player.head.rotation.y = -twist * sPh * 0.5;
   player.body.rotation.x = player.lean * 0.3;
   player.body.rotation.z = 0.008 * Math.sin(elapsed * 0.4) * iw;
-  /* bob phased to footfalls: two dips per cycle, at each plant */
-  player.body.position.y = Math.cos(ph * 2) * (0.030 + 0.018 * spdN) * mw + Math.sin(elapsed * 1.5) * 0.006 * iw;
+  /* bob: gentle two-dip at a walk; at a run a bigger, flatter-topped
+     bounce (the shaped curve hangs at the top — the flight moment) over
+     a slightly crouched base */
+  const c2 = Math.cos(ph * 2);
+  const bobShape = Math.sign(c2) * Math.pow(Math.abs(c2), lerp(1, 0.65, runW));
+  player.body.position.y = bobShape * lerp(0.040, 0.085, runW) * mw - 0.05 * runW * mw + Math.sin(elapsed * 1.5) * 0.006 * iw;
   player.body.position.x = sPh * 0.02 * mw + 0.012 * Math.sin(elapsed * 0.4) * iw;
   player.g.position.set(player.pos.x, player.y, player.pos.z);
   player.g.rotation.y = player.heading;
@@ -1857,8 +1881,14 @@ window.__solano = {
   exitCar: () => { if (mode === 'drive') exitCar(); },
   setKey: (code, down) => { keys[code] = !!down; },
   feetY: () => player.y,
-  gait: () => ({ phase: Math.round(player.phase * 100) / 100, mw: Math.round(player.mw * 100) / 100,
-                 spd: Math.round(Math.hypot(player.vx, player.vz) * 100) / 100 }),
+  gait: () => { const r3 = v => Math.round(v * 1000) / 1000, gd = player._gait || {};
+    return { phase: Math.round(player.phase * 100) / 100, mw: Math.round(player.mw * 100) / 100,
+             spd: Math.round(Math.hypot(player.vx, player.vz) * 100) / 100,
+             runW: r3(player.runW), hipAmp: r3(gd.hipAmp || 0), kneeAmp: r3(gd.kneeAmp || 0),
+             elbowBase: r3(gd.elbowBase || 0), armAmp: r3(gd.armAmp || 0),
+             torsoX: r3(player.torso.rotation.x), hipX: r3(player.legL.rotation.x),
+             kneeX: r3(player.kneeL.rotation.x), elbowX: r3(player.elbowL.rotation.x),
+             bodyY: r3(player.body.position.y) }; },
   grounded: () => player.grounded,
   standingOnCar: () => !!player.standingOn,
   promptOn: () => promptEl.classList.contains('on'),
