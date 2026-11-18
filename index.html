@@ -625,31 +625,60 @@ addTraffic(-104, 52, 0, 0.5, 0x3fae8a); addTraffic(-104, 52, 2, 0.1, 0xc0c6cc, '
 addTraffic(52, -104, 1, 0.2, 0x7a5fa0); addTraffic(52, -104, 3, 0.55, 0x2f6db3, 'pickup');
 const allCars = parkedCars.concat(trafficCars);
 
-/* ---------------- player character ---------------- */
-function limb(mat, w, h, d, px, py, pz, drop) {
-  const grp = new THREE.Group(); grp.position.set(px, py, pz);
-  const m = new THREE.Mesh(unitBox, mat); m.scale.set(w, h, d); m.position.y = -drop; m.castShadow = true;
-  grp.add(m); return grp;
-}
-const player = { pos: new THREE.Vector3(114, 0, 30), heading: -Math.PI / 2, vy: 0, jumpY: 0, grounded: true, phase: 0 };
+/* ---------------- player character ----------------
+   Low-poly person built from rounded forms: sphere head under a curved
+   red cap, tapered torso (shoulders wider than hips), capsule limbs with
+   short shirt sleeves and skin forearms, trousers and shoes. ~1.83 units
+   tall with the head ~1/7.5 of the height. Limbs pivot at the shoulder
+   and hip so the walk/run swing reads from the joints. */
+const player = { pos: new THREE.Vector3(114, 0, 30), heading: -Math.PI / 2, vy: 0, jumpY: 0, grounded: true, phase: 0, lean: 0 };
 {
   const skin = new THREE.MeshLambertMaterial({ color: 0xc98d64 });
   const shirt = new THREE.MeshLambertMaterial({ color: 0x1f8a8c });
   const pants = new THREE.MeshLambertMaterial({ color: 0x2c3e63 });
   const capM = new THREE.MeshLambertMaterial({ color: 0xe2574c });
-  const g = new THREE.Group();
-  const torso = new THREE.Mesh(unitBox, shirt); torso.scale.set(0.56, 0.68, 0.3); torso.position.y = 1.28; torso.castShadow = true; g.add(torso);
-  player.legL = limb(pants, 0.2, 0.9, 0.24, -0.14, 0.94, 0, 0.45);
-  player.legR = limb(pants, 0.2, 0.9, 0.24, 0.14, 0.94, 0, 0.45);
-  player.armL = limb(shirt, 0.16, 0.78, 0.2, -0.37, 1.56, 0, 0.34);
-  player.armR = limb(shirt, 0.16, 0.78, 0.2, 0.37, 1.56, 0, 0.34);
-  const handL = new THREE.Mesh(unitBox, skin); handL.scale.set(0.15, 0.18, 0.18); handL.position.y = -0.76; player.armL.add(handL);
-  const handR = handL.clone(); player.armR.add(handR);
-  const headG = new THREE.Group(); headG.position.y = 1.66;
-  const head = new THREE.Mesh(unitBox, skin); head.scale.set(0.34, 0.36, 0.32); head.position.y = 0.2; head.castShadow = true; headG.add(head);
-  const cap = new THREE.Mesh(unitBox, capM); cap.scale.set(0.38, 0.1, 0.36); cap.position.y = 0.42; headG.add(cap);
-  const brim = new THREE.Mesh(unitBox, capM); brim.scale.set(0.34, 0.05, 0.24); brim.position.set(0, 0.38, 0.28); headG.add(brim);
-  g.add(player.legL, player.legR, player.armL, player.armR, headG);
+  const shoeM = new THREE.MeshLambertMaterial({ color: 0x35312c });
+  const darkM = new THREE.MeshLambertMaterial({ color: 0x26190f });
+  const g = new THREE.Group();            // outer: world position + heading
+  const body = new THREE.Group();         // inner: walk bob + sprint lean
+  g.add(body); player.body = body;
+  function part(parent, geo, mat, x, y, z) {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(x, y, z); m.castShadow = true; parent.add(m); return m;
+  }
+  /* pelvis + tapered torso, flattened front-to-back */
+  part(body, new THREE.CylinderGeometry(0.148, 0.13, 0.2, 12), pants, 0, 0.96, 0).scale.set(1.12, 1, 0.8);
+  part(body, new THREE.CylinderGeometry(0.19, 0.136, 0.56, 14), shirt, 0, 1.24, 0).scale.set(1.18, 1, 0.76);
+  part(body, new THREE.CylinderGeometry(0.08, 0.095, 0.08, 10), shirt, 0, 1.52, 0);   // collar
+  part(body, new THREE.CylinderGeometry(0.05, 0.056, 0.1, 10), skin, 0, 1.55, 0);     // neck
+  /* legs: trouser capsules swinging from the hip, dark shoes */
+  function makeLeg(side) {
+    const grp = new THREE.Group(); grp.position.set(0.105 * side, 0.94, 0); body.add(grp);
+    part(grp, new THREE.CapsuleGeometry(0.08, 0.66, 4, 12), pants, 0, -0.43, 0);
+    part(grp, new THREE.BoxGeometry(0.11, 0.07, 0.27), shoeM, 0, -0.875, 0.04);
+    return grp;
+  }
+  player.legL = makeLeg(-1); player.legR = makeLeg(1);
+  /* arms: short shirt sleeve, skin forearm and hand, hanging to mid-thigh */
+  function makeArm(side) {
+    const grp = new THREE.Group(); grp.position.set(0.25 * side, 1.45, 0); body.add(grp);
+    part(grp, new THREE.CapsuleGeometry(0.06, 0.18, 4, 10), shirt, 0, -0.15, 0);
+    part(grp, new THREE.CapsuleGeometry(0.047, 0.17, 4, 10), skin, 0, -0.42, 0);
+    part(grp, new THREE.SphereGeometry(0.055, 10, 8), skin, 0, -0.6, 0);
+    return grp;
+  }
+  player.armL = makeArm(-1); player.armR = makeArm(1);
+  part(body, new THREE.SphereGeometry(0.072, 10, 8), shirt, -0.25, 1.45, 0);  // shoulder caps
+  part(body, new THREE.SphereGeometry(0.072, 10, 8), shirt, 0.25, 1.45, 0);
+  /* head: sphere with simple eyes; red cap as a flattened dome + curved brim */
+  const headG = new THREE.Group(); headG.position.y = 1.58; body.add(headG);
+  part(headG, new THREE.SphereGeometry(0.12, 18, 14), skin, 0, 0.13, 0);
+  part(headG, new THREE.SphereGeometry(0.016, 8, 6), darkM, -0.045, 0.15, 0.11);
+  part(headG, new THREE.SphereGeometry(0.016, 8, 6), darkM, 0.045, 0.15, 0.11);
+  const dome = part(headG, new THREE.SphereGeometry(0.129, 18, 10, 0, Math.PI * 2, 0, Math.PI * 0.52), capM, 0, 0.148, 0);
+  dome.scale.set(1, 0.82, 1);
+  const brim = part(headG, new THREE.CylinderGeometry(0.155, 0.16, 0.022, 14, 1, false, -Math.PI / 2, Math.PI), capM, 0, 0.185, 0.08);
+  brim.rotation.x = 0.1;
   g.position.copy(player.pos); g.rotation.y = player.heading;
   scene.add(g); player.g = g;
 }
@@ -829,6 +858,11 @@ function updateFoot(dt) {
   const sw = Math.sin(player.phase) * (player.swing || 0);
   player.legL.rotation.x = sw * 0.62; player.legR.rotation.x = -sw * 0.62;
   player.armL.rotation.x = -sw * 0.5; player.armR.rotation.x = sw * 0.5;
+  /* body language: gentle bob at stride frequency, forward lean with speed */
+  const sprinting = moving && (key('ShiftLeft') || key('ShiftRight'));
+  player.lean = lerp(player.lean, (player.swing || 0) * (sprinting ? 0.15 : 0.05), 1 - Math.exp(-8 * dt));
+  player.body.rotation.x = player.lean;
+  player.body.position.y = Math.abs(Math.sin(player.phase)) * 0.05 * (player.swing || 0);
   player.g.position.set(player.pos.x, groundY(player.pos.x, player.pos.z) + player.jumpY, player.pos.z);
   player.g.rotation.y = player.heading;
   /* E prompt */
