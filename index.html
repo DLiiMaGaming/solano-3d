@@ -9,7 +9,23 @@
     font-family: "Segoe UI", system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif;
     -webkit-user-select:none; user-select:none; }
   #app { position:fixed; inset:0; }
-  #app canvas { display:block; }
+  #app canvas { display:block; touch-action:none; }
+
+  /* touch controls: virtual joystick (left thumb) + action buttons,
+     revealed only once a touch has been seen */
+  #joy { position:fixed; z-index:11; width:120px; height:120px; border-radius:50%;
+    border:2px solid rgba(255,255,255,.35); background:rgba(10,16,24,.30);
+    display:none; pointer-events:none; }
+  #joyKnob { position:absolute; left:50%; top:50%; width:52px; height:52px;
+    margin:-26px 0 0 -26px; border-radius:50%;
+    background:rgba(255,255,255,.45); border:2px solid rgba(255,255,255,.5); }
+  .tbtn { position:fixed; z-index:11; width:64px; height:64px; border-radius:50%;
+    display:none; align-items:center; justify-content:center; font-weight:800;
+    font-size:14px; letter-spacing:1px; color:#fff; background:rgba(10,16,24,.5);
+    border:2px solid rgba(255,255,255,.4); text-shadow:0 1px 2px rgba(0,0,0,.7); }
+  body.touch .tbtn { display:flex; }
+  #btnAct { right:22px; bottom:100px; }
+  #btnJump { right:102px; bottom:24px; }
 
   .hud { position:fixed; z-index:10; color:#fff; pointer-events:none; }
   #titleBox { top:14px; left:16px; }
@@ -106,6 +122,10 @@
 </div>
 
 <div class="hud" id="prompt"><span class="key">E</span><span id="promptText">Enter car</span></div>
+
+<div id="joy"><div id="joyKnob"></div></div>
+<div id="btnAct" class="tbtn">E</div>
+<div id="btnJump" class="tbtn">JUMP</div>
 <div class="hud" id="toast"></div>
 
 <div class="hud" id="wantedBox">
@@ -496,7 +516,12 @@ for (const sx of STREETS.slice(0, 4)) for (const sz of STREETS.slice(0, 4)) {
     continue;
   }
   /* subdivide the block into a 3x3 lot grid, merging some neighbours */
-  const lot = 11.4, gap = 1.8, x0 = cx - lot - gap, z0 = cz - lot - gap;
+  /* lot size keeps every building behind the sidewalk: the farthest
+     face sits 2*lot + gap - 0.35 from the block centre, and at 17.25
+     that leaves it ~8.7 from the street centreline. The old 11.4 lots
+     reached 1.75 from the centrelines — outer buildings stood IN the
+     traffic lanes and cars drove through their corners. */
+  const lot = 7.9, gap = 1.8, x0 = cx - lot - gap, z0 = cz - lot - gap;
   const used = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
   for (let ix = 0; ix < 3; ix++) for (let iz = 0; iz < 3; iz++) {
     if (used[ix][iz]) continue;
@@ -662,6 +687,8 @@ addBoat(226, 11, 0.05, 0xe8b13c, false);
 
 /* ---------------- cars ---------------- */
 const glassMat = new THREE.MeshPhongMaterial({ color: 0x1d2733, shininess: 90, specular: 0x88aacc });
+/* cracked, light-dead glass a car switches to once it is properly bent */
+const glassHitMat = new THREE.MeshPhongMaterial({ color: 0x0a0d10, shininess: 18, specular: 0x223044 });
 const headMat = new THREE.MeshLambertMaterial({ color: 0xfff3c4, emissive: 0xffedb5, emissiveIntensity: 0.7 });
 const tailMat = new THREE.MeshLambertMaterial({ color: 0xd92b2b, emissive: 0xa11212, emissiveIntensity: 0.7 });
 /* police lightbar materials — shared by every cruiser; the main loop
@@ -681,6 +708,67 @@ const wheelGeo = (() => {
    colours are baked per-vertex, so all the detail parts below ride in
    the SAME merged mesh as the shell — detail costs no draw calls */
 const carPaintMat = new THREE.MeshPhongMaterial({ vertexColors: true, shininess: 70, specular: 0x555555 });
+/* ---------------- crash particles: smoke & sparks ----------------
+   Two shared point clouds for the whole city (2 extra draw calls,
+   however many cars burn): smoke puffs rise from the crushed end of
+   any car whose total damage passes ~0.45; sparks burst out of hard
+   impacts. Idle particles park far below the map. */
+function makePoints(n, size, color, opacity, additive) {
+  const geo = new THREE.BufferGeometry();
+  const arr = new Float32Array(n * 3).fill(-999);
+  geo.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+  const mat = new THREE.PointsMaterial({ size, color, transparent: true, opacity, depthWrite: false,
+    blending: additive ? THREE.AdditiveBlending : THREE.NormalBlending, sizeAttenuation: true });
+  const pts = new THREE.Points(geo, mat); pts.frustumCulled = false; scene.add(pts);
+  return { pts, arr, vel: new Float32Array(n * 3), life: new Float32Array(n), i: 0 };
+}
+const smoke = makePoints(260, 1.5, 0x494a4e, 0.34, false);
+const sparks = makePoints(160, 0.32, 0xffb03a, 0.95, true);
+function spawnPuff(P, x, y, z, vx, vy, vz, life) {
+  const i = P.i; P.i = (P.i + 1) % P.life.length;
+  P.arr[i * 3] = x; P.arr[i * 3 + 1] = y; P.arr[i * 3 + 2] = z;
+  P.vel[i * 3] = vx; P.vel[i * 3 + 1] = vy; P.vel[i * 3 + 2] = vz;
+  P.life[i] = life;
+}
+function burstSparks(x, y, z, n, spread) {
+  for (let k = 0; k < n; k++) {
+    const a = Math.random() * Math.PI * 2, r = Math.random() * spread;
+    spawnPuff(sparks, x, y, z, Math.cos(a) * r, Math.random() * 2.6 + 0.6, Math.sin(a) * r, 0.45 + Math.random() * 0.4);
+  }
+}
+function stepParticles(P, dt, buoy, drag) {
+  let any = false;
+  for (let i = 0; i < P.life.length; i++) {
+    if (P.life[i] <= 0) continue;
+    any = true;
+    P.life[i] -= dt;
+    if (P.life[i] <= 0) { P.arr[i * 3 + 1] = -999; continue; }
+    P.vel[i * 3 + 1] += buoy * dt;
+    const dr = Math.exp(-drag * dt);
+    P.vel[i * 3] *= dr; P.vel[i * 3 + 2] *= dr;
+    P.arr[i * 3] += P.vel[i * 3] * dt;
+    P.arr[i * 3 + 1] += P.vel[i * 3 + 1] * dt;
+    P.arr[i * 3 + 2] += P.vel[i * 3 + 2] * dt;
+  }
+  if (any) P.pts.geometry.attributes.position.needsUpdate = true;
+}
+function updateParticles(dt) {
+  stepParticles(smoke, dt, 0.55, 0.4);
+  stepParticles(sparks, dt, -5.5, 0.1);
+  for (const car of allCars) {
+    if (car.dmgF + car.dmgR < 0.45) continue;
+    car.smokeAcc += dt * (6 + (car.dmgF + car.dmgR) * 10);
+    const p = car.g.position, s = Math.sin(car.heading), c = Math.cos(car.heading);
+    const lz = car.dmgF >= car.dmgR ? 1.9 : -1.9;   // smoke pours from the crushed end
+    while (car.smokeAcc >= 1) {
+      car.smokeAcc -= 1;
+      const lx = (Math.random() - 0.5) * 0.5;
+      spawnPuff(smoke, p.x + lx * c + lz * s, p.y + 1.0, p.z - lx * s + lz * c,
+        (Math.random() - 0.5) * 0.3, 1.1 + Math.random() * 0.7, (Math.random() - 0.5) * 0.3,
+        1.4 + Math.random() * 1.1);
+    }
+  }
+}
 const rearAxleGeo = (() => {
   const l = wheelGeo.clone(); l.translate(-0.88, 0, 0);
   const r = wheelGeo.clone(); r.translate(0.88, 0, 0);
@@ -775,6 +863,10 @@ function makeCar(color, style) {
   const bodyM = new THREE.Mesh(mergeGeos(P), carPaintMat);
   bodyM.castShadow = true; g.add(bodyM);
   const cab = new THREE.Mesh(cabGeo, glassMat); cab.castShadow = true; g.add(cab);
+  /* pristine copies of the shell's vertices + colours: crash damage
+     crumples the mesh by displacing from these (see applyDamageVisual) */
+  bodyM.geometry.userData.basePos = bodyM.geometry.attributes.position.array.slice();
+  bodyM.geometry.userData.baseCol = bodyM.geometry.attributes.color.array.slice();
   if (style === 'taxi') {
     const sign = new THREE.Mesh(unitBox, new THREE.MeshLambertMaterial({ color: 0xfff6d8, emissive: 0xffe9a0, emissiveIntensity: 0.55 }));
     sign.scale.set(0.62, 0.17, 0.34); sign.position.set(0, 1.62, -0.2); g.add(sign);
@@ -803,7 +895,56 @@ function makeCar(color, style) {
   scene.add(g);
   return { g, heading: 0, v: 0, steer: 0, wheels, wheelsF, traffic: null, spin: 0, style,
            throttle: 0, brake: 0, police: false,
-           vx: 0, vz: 0, kx: 0, kz: 0, yawRate: 0, knockT: 0, awake: false };
+           vx: 0, vz: 0, kx: 0, kz: 0, yawRate: 0, knockT: 0, awake: false,
+           bodyM, cabM: cab, dmgF: 0, dmgR: 0, smokeAcc: 0 };
+}
+/* ---------------- crash damage ----------------
+   dmgF / dmgR are permanent per-car damage levels for the front and
+   rear ends, fed by every impact path (ramInto, wall hits in the
+   drive/cruiser updates, hard slide stops). The visual is recomputed
+   from the pristine shell on each change: vertices in the crushed
+   zone fold inward with per-vertex jitter (a real dent, not a texture),
+   their colours darken like bent, dirty metal, the nose/tail drops,
+   and past ~0.22 total the glass goes dark and dead. Hard hits throw
+   sparks from the struck end; past ~0.45 total the crushed end smokes
+   (see updateParticles). */
+function addDamage(car, amt, front) {
+  if (amt <= 0 || !car.bodyM) return;
+  if (front) car.dmgF = clamp(car.dmgF + amt, 0, 1); else car.dmgR = clamp(car.dmgR + amt, 0, 1);
+  if (amt >= 0.12) {
+    const p = car.g.position, s = Math.sin(car.heading), c = Math.cos(car.heading), lz = front ? 2.2 : -2.2;
+    burstSparks(p.x + lz * s, p.y + 0.65, p.z + lz * c, 14, 2.4);
+  }
+  applyDamageVisual(car);
+}
+function applyDamageVisual(car) {
+  const geo = car.bodyM.geometry, pos = geo.attributes.position, col = geo.attributes.color;
+  const base = geo.userData.basePos, baseCol = geo.userData.baseCol;
+  const dF = car.dmgF, dR = car.dmgR;
+  for (let i = 0; i < pos.count; i++) {
+    const bx = base[i * 3], by = base[i * 3 + 1], bz = base[i * 3 + 2];
+    let x = bx, y = by, z = bz, shade = 1;
+    const hsh = Math.sin(i * 127.1) * 43758.5453, rnd = hsh - Math.floor(hsh);
+    if (bz > 1.05 && dF > 0) {
+      const t = Math.min(1, (bz - 1.05) / 1.25);
+      z -= dF * 0.55 * t * t * (0.65 + 0.7 * rnd);
+      y -= dF * 0.16 * t * (0.5 + rnd * 0.5);
+      x *= 1 - dF * 0.10 * t;
+      shade = 1 - 0.5 * dF * t;
+    } else if (bz < -1.05 && dR > 0) {
+      const t = Math.min(1, (-bz - 1.05) / 1.25);
+      z += dR * 0.55 * t * t * (0.65 + 0.7 * rnd);
+      y -= dR * 0.16 * t * (0.5 + rnd * 0.5);
+      x *= 1 - dR * 0.10 * t;
+      shade = 1 - 0.5 * dR * t;
+    }
+    pos.setXYZ(i, x, y, z);
+    col.setXYZ(i, baseCol[i * 3] * shade, baseCol[i * 3 + 1] * shade, baseCol[i * 3 + 2] * shade);
+  }
+  pos.needsUpdate = true; col.needsUpdate = true;
+  geo.computeVertexNormals();
+  car.bodyM.rotation.x = (dF - dR) * 0.03;   // the crushed end sags
+  if (dF + dR > 0.22 && car.cabM.material === glassMat) car.cabM.material = glassHitMat;
 }
 const carColors = [0xd94f3d, 0x3f7fbf, 0xe8e4da, 0x3fae8a, 0xe8b13c, 0x7a5fa0, 0xc0c6cc, 0x2f6db3, 0x8a8f94, 0xb03a5b];
 const parkedCars = [];
@@ -1003,6 +1144,49 @@ function carBlocked(x, z, r, self) {
     if (dx * dx + dz * dz < 4.1 * 4.1) return true; }
   return false;
 }
+/* oriented-rectangle collision for a whole car pose. The centre circle
+   above (r 2.05) is shorter than the car (half-length 2.3), so noses
+   and corners used to sink into buildings, and a car turning beside a
+   wall swept its corners through it. carPoseBlocked tests the car's
+   actual footprint — SAT against every building AABB, circle props,
+   and the other cars as circles — so a pose (position AND heading) is
+   only ever adopted if the whole car fits there. */
+const CAR_HX = 1.02, CAR_HZ = 2.34;
+function obbHitsColliders(x, z, s, c) {
+  for (const b of colliders) {
+    const bcx = (b.minX + b.maxX) / 2, bcz = (b.minZ + b.maxZ) / 2;
+    const bhx = (b.maxX - b.minX) / 2, bhz = (b.maxZ - b.minZ) / 2;
+    const dx = bcx - x, dz = bcz - z;
+    if (Math.abs(dx) > bhx + CAR_HX + CAR_HZ || Math.abs(dz) > bhz + CAR_HX + CAR_HZ) continue;
+    const as = Math.abs(s), ac = Math.abs(c);
+    if (Math.abs(dx) >= bhx + ac * CAR_HX + as * CAR_HZ) continue;         // world X axis separates
+    if (Math.abs(dz) >= bhz + as * CAR_HX + ac * CAR_HZ) continue;         // world Z axis separates
+    if (Math.abs(dx * c - dz * s) >= CAR_HX + bhx * ac + bhz * as) continue;   // car X axis separates
+    if (Math.abs(dx * s + dz * c) >= CAR_HZ + bhx * as + bhz * ac) continue;   // car Z axis separates
+    return true;
+  }
+  return false;
+}
+function carPoseBlocked(x, z, heading, self) {
+  if (x < -166 || x > 236 || z < -166 || z > 166) return true;
+  if (x > 157 && groundY(x, z) < 0.3) return true;               // the sea
+  const s = Math.sin(heading), c = Math.cos(heading);
+  if (obbHitsColliders(x, z, s, c)) return true;
+  for (const o of circles) {
+    const wx = o.x - x, wz = o.z - z;
+    const lx = wx * c - wz * s, lz = wx * s + wz * c;
+    const qx = clamp(lx, -CAR_HX, CAR_HX), qz = clamp(lz, -CAR_HZ, CAR_HZ);
+    const ddx = lx - qx, ddz = lz - qz;
+    if (ddx * ddx + ddz * ddz < o.r * o.r) return true;
+  }
+  for (const car of allCars) { if (car === self) continue;
+    const wx = car.g.position.x - x, wz = car.g.position.z - z;
+    const lx = wx * c - wz * s, lz = wx * s + wz * c;
+    const qx = clamp(lx, -CAR_HX, CAR_HX), qz = clamp(lz, -CAR_HZ, CAR_HZ);
+    const ddx = lx - qx, ddz = lz - qz;
+    if (ddx * ddx + ddz * ddz < 2.0 * 2.0) return true; }
+  return false;
+}
 
 /* ---------------- input ---------------- */
 const keys = {};
@@ -1028,16 +1212,38 @@ window.addEventListener('keydown', (e) => {
 window.addEventListener('keyup', (e) => { keys[e.code] = false; });
 let dragging = false, lastMX = 0, lastMY = 0;
 renderer.domElement.addEventListener('pointerdown', (e) => {
-  dragging = true; lastMX = e.clientX; lastMY = e.clientY; ensureAudio();
+  ensureAudio();
+  if (e.pointerType === 'touch') {
+    document.body.classList.add('touch');
+    /* left thumb = joystick; a touch anywhere else still orbits the camera */
+    if (e.clientX < window.innerWidth * 0.55 && !joy.active) {
+      joy.active = true; joy.id = e.pointerId; joy.ox = e.clientX; joy.oy = e.clientY;
+      joy.nx = 0; joy.ny = 0; joy.rx = 0; joy.ry = 0; joy.mag = 0;
+      joyEl.style.display = 'block';
+      joyEl.style.left = (e.clientX - 60) + 'px'; joyEl.style.top = (e.clientY - 60) + 'px';
+      joyKnob.style.transform = 'translate(0px, 0px)';
+      renderer.domElement.setPointerCapture(e.pointerId);
+      return;
+    }
+  }
+  dragging = true; lastMX = e.clientX; lastMY = e.clientY;
   renderer.domElement.setPointerCapture(e.pointerId);
 });
 renderer.domElement.addEventListener('pointermove', (e) => {
+  if (joy.active && e.pointerId === joy.id) { joyMove(e); return; }
   if (!dragging) return;
   camYaw -= (e.clientX - lastMX) * 0.0052;
   camPitch = clamp(camPitch + (e.clientY - lastMY) * 0.004, 0.05, 1.25);
   lastMX = e.clientX; lastMY = e.clientY; lastDragT = performance.now();
 });
-renderer.domElement.addEventListener('pointerup', () => { dragging = false; });
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (joy.active && e.pointerId === joy.id) { joyEnd(); return; }
+  dragging = false;
+});
+renderer.domElement.addEventListener('pointercancel', (e) => {
+  if (joy.active && e.pointerId === joy.id) { joyEnd(); return; }
+  dragging = false;
+});
 renderer.domElement.addEventListener('wheel', (e) => {
   camDist = clamp(camDist * (1 + e.deltaY * 0.001), 5, 22); lastDragT = performance.now();
 }, { passive: true });
@@ -1047,7 +1253,43 @@ window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 function key(code) { return !!keys[code]; }
-function driveKey(code, alt) { return key(code) || key(alt); }
+function driveKey(code, alt) { return key(code) || key(alt) || !!vkeys[code]; }
+
+/* ---------------- touch controls ----------------
+   Left-thumb virtual joystick + E / JUMP buttons. The stick is ANALOG:
+   its tilt sets the pace (gentle push = walk, full push = sprint), so
+   the run speed and the run gait are reachable on a phone, where there
+   is no Shift key. In a car the stick feeds the pedals/wheel as
+   virtual keys. Buttons appear once any touch has been seen. */
+const vkeys = {};
+const joy = { active: false, id: null, ox: 0, oy: 0, nx: 0, ny: 0, rx: 0, ry: 0, mag: 0 };
+const joyEl = document.getElementById('joy'), joyKnob = document.getElementById('joyKnob');
+function joyMove(e) {
+  let dx = e.clientX - joy.ox, dy = e.clientY - joy.oy;
+  const d = Math.hypot(dx, dy), max = 52;
+  if (d > max) { dx *= max / d; dy *= max / d; }
+  joy.rx = dx / max; joy.ry = dy / max;                       // raw tilt, -1..1
+  joy.mag = Math.min(1, Math.hypot(dx, dy) / max);
+  const dd = Math.hypot(dx, dy) || 1;
+  joy.nx = dx / dd; joy.ny = dy / dd;                        // unit direction
+  if (joy.mag < 0.12) { joy.nx = 0; joy.ny = 0; }
+  joyKnob.style.transform = `translate(${dx}px, ${dy}px)`;
+  vkeys.KeyW = joy.ry < -0.35; vkeys.KeyS = joy.ry > 0.35;
+  vkeys.KeyA = joy.rx < -0.35; vkeys.KeyD = joy.rx > 0.35;
+}
+function joyEnd() {
+  joy.active = false; joy.id = null; joy.mag = 0; joy.nx = 0; joy.ny = 0; joy.rx = 0; joy.ry = 0;
+  vkeys.KeyW = vkeys.KeyS = vkeys.KeyA = vkeys.KeyD = false;
+  joyEl.style.display = 'none';
+}
+window.addEventListener('touchstart', () => document.body.classList.add('touch'), { once: true });
+function bindBtn(el, down, up) {
+  el.addEventListener('touchstart', (e) => { e.preventDefault(); document.body.classList.add('touch'); ensureAudio(); down(); }, { passive: false });
+  el.addEventListener('touchend', (e) => { e.preventDefault(); if (up) up(); }, { passive: false });
+  el.addEventListener('touchcancel', () => { if (up) up(); });
+}
+bindBtn(document.getElementById('btnAct'), () => toggleCar());
+bindBtn(document.getElementById('btnJump'), () => { keys['Space'] = true; }, () => { keys['Space'] = false; });
 
 /* ---------------- audio (tiny synth, starts on first interaction) ---------------- */
 let AC = null, engOsc = null, engGain = null, engFilter = null;
@@ -1126,9 +1368,18 @@ function updateFoot(dt) {
   let ix = (driveKey('KeyD', 'ArrowRight') ? 1 : 0) - (driveKey('KeyA', 'ArrowLeft') ? 1 : 0);
   let iz = (driveKey('KeyW', 'ArrowUp') ? 1 : 0) - (driveKey('KeyS', 'ArrowDown') ? 1 : 0);
   let mx = viewX * iz + rightX * ix, mz = viewZ * iz + rightZ * ix;
-  const len = Math.hypot(mx, mz);
   const sprinting = key('ShiftLeft') || key('ShiftRight');
-  const topSpeed = sprinting ? 8.6 : 5.2;
+  let topSpeed = sprinting ? 8.6 : 5.2;
+  /* touch joystick (analog): the stick sets both direction and pace —
+     a gentle tilt walks, a full tilt runs, so the sprint and the run
+     gait are reachable on a phone with no Shift key */
+  if (joy.active && joy.mag > 0.12) {
+    mx = viewX * -joy.ny + rightX * joy.nx;
+    mz = viewZ * -joy.ny + rightZ * joy.nx;
+    topSpeed = joy.mag <= 0.65 ? 5.2 * (joy.mag / 0.65)
+                               : lerp(5.2, 8.6, (joy.mag - 0.65) / 0.35);
+  }
+  const len = Math.hypot(mx, mz);
   let dvx = 0, dvz = 0;
   if (len > 0.01) { dvx = mx / len * topSpeed; dvz = mz / len * topSpeed; }
   /* velocity eases toward the desired velocity: ~0.16 s ramp up (in the
@@ -1183,53 +1434,77 @@ function updateFoot(dt) {
     player.body.scale.set(1 + sq * 0.55, 1 - sq, 1 + sq * 0.55);
   } else if (player.body.scale.y !== 1) player.body.scale.set(1, 1, 1);
   /* ---- procedural gait on jointed limbs ----
-     Per leg, phase u (the right leg runs at u + π): the hip swings as a
-     sine; the knee bends on a −cos curve, peaking mid-swing (u = π, leg
-     passing under the body) and straight at plant and toe-off, so the
-     foot lifts through an arc instead of dragging on a stick; the ankle
-     plantar-flexes at push-off. Arms swing against the same-side leg
-     with an elbow bend that deepens toward a sprint. Pelvis and torso
-     counter-rotate a few degrees; the head counter-pitches and
-     counter-yaws to stay level. All of it is weighted by mw (an eased
-     move weight) so stopping glides into a gentle breathing idle
-     instead of freezing mid-stride. The bob lives in the body group —
-     the physics origin (feet at player.y) never moves. */
+     Per leg, phase u (the right leg runs at u + π): the hip swings on a
+     shaped sine; the knee bends on a −cos curve, peaking mid-swing
+     (u = π, leg passing under the body) and straight at plant and
+     toe-off, so the foot lifts through an arc instead of dragging on a
+     stick; the ankle plantar-flexes at push-off. All of it is weighted
+     by mw (an eased move weight) so stopping glides into a gentle
+     breathing idle instead of freezing mid-stride. The bob lives in the
+     body group — the physics origin (feet at player.y) never moves.
+
+     Third pass — sell walk vs run FROM BEHIND. The chase camera barely
+     sees torso pitch or knee fold; it sees YAW, ROLL, ARM DRIVE and
+     BOUNCE. So those channels now carry the walk/run difference: the
+     shoulders counter-rotate against the hips (lazy at a walk, driving
+     at a run), the pelvis rolls and the body sways over the stance
+     foot, arms hang loose on a laggy pendulum at a walk but tuck in and
+     jab BACK at a run, and the bounce grows a real flight hang. Every
+     channel is sampled at its own phase lag (arms trail the legs, the
+     torso trails the pelvis, the head trails the torso) and the curves
+     are shaped, not pure sines, with a touch of left/right asymmetry —
+     the loop must not read as a mirrored robot. */
   const spdN = clamp(spd / 8.6, 0, 1);
   player.mw += ((player.grounded ? clamp(spd / 1.6, 0, 1) : player.mw) - player.mw) * (1 - Math.exp(-dt / 0.16));
   player.airW += ((player.grounded ? 0 : 1) - player.airW) * (1 - Math.exp(-dt / 0.12));
   /* run factor: 0 at a walk, 1 at a full sprint. The pose is BLENDED
-     between two qualitatively different gaits on this factor — a walk is
-     upright with hanging arms and a gentle knee lift, a run leans hard
-     into the stride with driving thighs, a deep heel-kick fold, and
-     elbows bent ~90° pumping tight to the torso. Merely scaling one
-     curve's amplitudes read as the same pose at two tempos (playtest
-     feedback), so every channel below lerps between distinct walk and
-     run values instead. */
+     between two qualitatively different gaits on this factor (playtest
+     feedback: merely scaling one curve's amplitudes read as the same
+     pose at two tempos), so every channel below lerps between distinct
+     walk and run values instead. */
   player.runW += ((player.grounded ? sstep(5.4, 8.2, spd) : player.runW) - player.runW) * (1 - Math.exp(-dt / 0.18));
   const mw = player.mw, iw = 1 - mw, ph = player.phase, sPh = Math.sin(ph);
   const runW = player.runW;
   const hipAmp = lerp(0.30 + spd * 0.05, 1.02, runW) * mw;   // run thighs swing far wider
   const hipBias = -0.18 * runW * mw;          // ...and the swing shifts forward: front thigh drives up toward horizontal, less time trailing
-  const kneeAmp = lerp(clamp(0.55 + spd * 0.075, 0.55, 1.2), 2.05, runW) * mw;  // run folds the shin deep (heel toward butt)
-  const armAmp = hipAmp * lerp(0.72, 0.70, runW);
+  const kneeAmp = lerp(clamp(0.55 + spd * 0.075, 0.55, 1.2), 2.15, runW) * mw;  // run folds the shin deep (heel toward butt)
+  const hipHarm = lerp(0.04, 0.16, runW);     // 2nd harmonic: snappier swing-through, dwell at plant/toe-off
+  const pelvisYawAmp = lerp(0.075, 0.17, runW) * mw;
+  const torsoYawAmp = lerp(0.11, 0.30, runW) * mw;
+  const pelvisRollAmp = lerp(0.035, 0.085, runW) * mw;
+  function poseLeg(hip, knee, foot, u, side, asym) {
+    const s = Math.sin(u), c = Math.cos(u);
+    hip.rotation.x = hipAmp * asym * (s + hipHarm * Math.sin(2 * u)) + hipBias;
+    hip.rotation.z = side * lerp(0.012, 0.075, runW) * mw;   // narrow casual stance -> wide athletic base
+    knee.rotation.x = 0.04 * mw + kneeAmp * (side < 0 ? 1 : 1.05) * Math.pow(Math.max(0, -c), 1.3);
+    foot.rotation.x = mw * (lerp(0.32, 0.58, runW) * Math.pow(Math.max(0, s), 1.5) + 0.12 * Math.max(0, -c));
+    foot.rotation.y = side * 0.10 * runW * mw;               // slight toe-out at a run flashes the shoe soles behind
+  }
+  poseLeg(player.legL, player.kneeL, player.footL, ph, -1, 1);
+  poseLeg(player.legR, player.kneeR, player.footR, ph + Math.PI, 1, 0.95);
+  /* arms oppose the same-side leg, but sampled at a lagged phase — they
+     trail the legs (loose at a walk, tighter at a run) — and at a run
+     the backward half of the swing is boosted, so the elbows visibly
+     jab back past the torso, the strongest from-behind run cue */
+  const armLag = lerp(0.48, 0.18, runW);
+  const armAmp = hipAmp * lerp(0.62, 0.98, runW);
   const elbowBase = lerp(0.22, 1.45, runW) * mw + 0.14 * iw; // walk: near-straight hanging arm; run: ~90° pump
   const elbowPulse = lerp(0.10, 0.38, runW) * mw;
-  function poseLeg(hip, knee, foot, u) {
-    const s = Math.sin(u), c = Math.cos(u);
-    hip.rotation.x = hipAmp * s + hipBias;
-    knee.rotation.x = 0.04 * mw + kneeAmp * Math.pow(Math.max(0, -c), 1.3);
-    foot.rotation.x = mw * (lerp(0.32, 0.5, runW) * Math.pow(Math.max(0, s), 1.5) + 0.12 * Math.max(0, -c));
-  }
-  poseLeg(player.legL, player.kneeL, player.footL, ph);
-  poseLeg(player.legR, player.kneeR, player.footR, ph + Math.PI);
-  function poseArm(sh, el, u, side) {       // u = same-side leg phase; the arm opposes it
-    sh.rotation.x = -armAmp * Math.sin(u);
-    sh.rotation.z = -side * 0.09 * runW * mw;   // elbows tuck in toward the torso at a run
-    el.rotation.x = -(elbowBase + elbowPulse * Math.max(0, Math.sin(u)));
+  const armNegExp = lerp(1.05, 0.68, runW), armPosExp = lerp(1.05, 1.35, runW);
+  function poseArm(sh, el, u, side) {
+    const ua = u - armLag, s = Math.sin(ua);
+    const shaped = s >= 0 ? Math.pow(s, armPosExp) : -Math.pow(-s, armNegExp);
+    sh.rotation.x = -armAmp * shaped;
+    /* hang loose and slightly out at a walk, with a lazy sideways sway;
+       tuck tight to the ribs at a run */
+    sh.rotation.z = side * (lerp(0.10, -0.07, runW) * mw + 0.05 * iw)
+                  + side * 0.035 * Math.sin(ua - 0.5) * lerp(1, 0.35, runW) * mw;
+    el.rotation.x = -(elbowBase + elbowPulse * Math.pow(Math.max(0, s), lerp(1, 1.4, runW)))
+                    + 0.03 * Math.sin(elapsed * 1.7 + side * 2.1) * (1 - runW) * mw;
   }
   poseArm(player.armL, player.elbowL, ph, -1);
   poseArm(player.armR, player.elbowR, ph + Math.PI, 1);
-  player._gait = { runW, hipAmp, kneeAmp, elbowBase, armAmp };
+  player._gait = { runW, hipAmp, kneeAmp, elbowBase, armAmp, torsoYawAmp, pelvisYawAmp, pelvisRollAmp, armLag };
   /* airborne: settle into a loose tucked jump pose over the gait */
   if (player.airW > 0.01) {
     const a = player.airW;
@@ -1243,30 +1518,39 @@ function updateFoot(dt) {
     player.armR.rotation.z = lerp(player.armR.rotation.z, 0.18, a);
   }
   /* (no arm-z reset needed on landing: poseArm re-owns rotation.z every frame) */
-  /* counter-rotation, torso language, stable head */
-  const twist = lerp(0.10, 0.16, runW) * mw;
-  player.pelvis.rotation.y = -twist * sPh;
-  player.pelvis.rotation.z = -0.02 * sPh * mw;
-  player.torso.rotation.y = twist * sPh * 0.85;
-  player.torso.rotation.z = 0.045 * sPh * mw;
-  /* torso pitch is a headline walk/run difference: near-upright at a
-     walk (~0.04 rad), a hard forward lean at a sprint (~0.32 rad) */
+  /* counter-rotation, torso language, stable head — each layer trails
+     the one below it, so the twist ripples up the body (pelvis, then
+     shoulders, then the head settling last) instead of every part
+     peaking on the same frame like a robot */
+  const torsoLag = lerp(0.24, 0.12, runW), headLag = torsoLag + lerp(0.30, 0.18, runW);
+  player.pelvis.rotation.y = -pelvisYawAmp * Math.sin(ph - 0.08);
+  player.pelvis.rotation.z = -pelvisRollAmp * sPh;
+  player.pelvis.rotation.x = 0.06 * runW * mw;
+  const tS = Math.sin(ph - torsoLag);
+  player.torso.rotation.y = torsoYawAmp * (tS + 0.12 * runW * Math.sin(2 * (ph - torsoLag)));
+  player.torso.rotation.z = lerp(0.04, 0.07, runW) * mw * Math.sin(ph - torsoLag - 0.1);
+  /* torso pitch stays as a secondary cue: near-upright at a walk
+     (~0.04 rad), a hard forward lean at a sprint (~0.32 rad) */
   player.lean = lerp(player.lean, lerp(0.035, 0.32, runW) * mw, 1 - Math.exp(-8 * dt));
   const breathe = Math.sin(elapsed * 1.5) * iw;
   player.torso.rotation.x = player.lean + breathe * 0.012;
-  /* the head counter-pitches less at a run and tucks slightly forward,
-     instead of staying perfectly level like at a walk */
+  /* the head counter-pitches less at a run and tucks slightly forward;
+     its counter-yaw and counter-roll arrive late, like a real head
+     stabilising against the shoulders' swing */
   player.head.rotation.x = -player.lean * lerp(0.72, 0.45, runW) + 0.05 * runW + breathe * 0.006;
-  player.head.rotation.y = -twist * sPh * 0.5;
+  player.head.rotation.y = -torsoYawAmp * 0.62 * Math.sin(ph - headLag);
+  player.head.rotation.z = -lerp(0.04, 0.07, runW) * mw * 0.55 * Math.sin(ph - headLag);
   player.body.rotation.x = player.lean * 0.3;
-  player.body.rotation.z = 0.008 * Math.sin(elapsed * 0.4) * iw;
-  /* bob: gentle two-dip at a walk; at a run a bigger, flatter-topped
-     bounce (the shaped curve hangs at the top — the flight moment) over
-     a slightly crouched base */
+  player.body.rotation.z = pelvisRollAmp * 0.35 * Math.sin(ph - 0.1) + 0.008 * Math.sin(elapsed * 0.4) * iw;
+  /* bob + sway: a soft two-dip at a walk; at a run a bigger bounce with
+     a flatter top (the flight hang) and uneven dips, over a slightly
+     crouched base, while the whole body shifts sideways over the
+     stance foot */
   const c2 = Math.cos(ph * 2);
-  const bobShape = Math.sign(c2) * Math.pow(Math.abs(c2), lerp(1, 0.65, runW));
-  player.body.position.y = bobShape * lerp(0.040, 0.085, runW) * mw - 0.05 * runW * mw + Math.sin(elapsed * 1.5) * 0.006 * iw;
-  player.body.position.x = sPh * 0.02 * mw + 0.012 * Math.sin(elapsed * 0.4) * iw;
+  const bobShape = Math.sign(c2) * Math.pow(Math.abs(c2), lerp(1, 0.6, runW));
+  const dipAsym = 1 + 0.10 * runW * sPh;
+  player.body.position.y = bobShape * lerp(0.040, 0.105, runW) * mw * dipAsym - 0.055 * runW * mw + Math.sin(elapsed * 1.5) * 0.006 * iw;
+  player.body.position.x = Math.sin(ph - 0.2) * lerp(0.02, 0.05, runW) * mw + 0.012 * Math.sin(elapsed * 0.4) * iw;
   player.g.position.set(player.pos.x, player.y, player.pos.z);
   player.g.rotation.y = player.heading;
   /* E prompt — same helper and radius as the E action itself */
@@ -1290,10 +1574,17 @@ function updateDrive(dt) {
   car.v -= car.v * (wIn || sIn ? 0.3 : 0.85) * dt;
   car.v = clamp(car.v, -9, 33);
   if (!wIn && !sIn && Math.abs(car.v) < 0.05) car.v = 0;
+  /* pose-gated move: the new position AND heading are only adopted if
+     the whole car footprint fits there — the old centre-circle check
+     let the nose and the turning corners sink into buildings */
+  const oldHeading = car.heading;
   car.heading += (car.v / 2.7) * Math.tan(car.steer) * dt;
-  p.x += Math.sin(car.heading) * car.v * dt;
-  p.z += Math.cos(car.heading) * car.v * dt;
-  if (carBlocked(p.x, p.z, 2.05, car)) {
+  const nx = p.x + Math.sin(car.heading) * car.v * dt;
+  const nz = p.z + Math.cos(car.heading) * car.v * dt;
+  if (!carPoseBlocked(nx, nz, car.heading, car)) { p.x = nx; p.z = nz; }
+  else if (!carPoseBlocked(nx, nz, oldHeading, car)) { p.x = nx; p.z = nz; car.heading = oldHeading; }
+  else {
+    car.heading = oldHeading;
     const impact = Math.abs(car.v);
     const blocker = nearestOtherCar(p.x, p.z, 4.6, car);
     /* crimes: a hard hit on another car (worse: a police cruiser) or a
@@ -1315,9 +1606,9 @@ function updateDrive(dt) {
       else gentlePush(car, blocker, dt);
       car.v *= 0.35; if (Math.abs(car.v) < 0.5) car.v = 0;
     } else {
+      if (impact > 3.2) addDamage(car, Math.min(0.45, (impact - 3.2) * 0.032), car.v > 0);   // wall/fence: crumple the hitting end
       car.v = -car.v * 0.28; if (Math.abs(car.v) < 1) car.v = 0;
     }
-    p.x = _prev.x; p.z = _prev.z;
   }
   p.y = lerp(p.y, groundY(p.x, p.z), 1 - Math.exp(-10 * dt));
   car.g.rotation.y = car.heading;
@@ -1350,16 +1641,19 @@ function integrateSlide(car, dt) {
   const p = car.g.position;
   const ox = p.x, oz = p.z, oh = car.heading;
   const nx = p.x + car.vx * dt, nz = p.z + car.vz * dt;
-  if (!carBlocked(nx, nz, 2.05, car)) { p.x = nx; p.z = nz; }
+  if (!carPoseBlocked(nx, nz, car.heading, car)) { p.x = nx; p.z = nz; }
   else {
     const other = nearestOtherCar(nx, nz, 4.6, car);
     if (other) ramInto(car, other, car.vx, car.vz);
     car.vx *= 0.45; car.vz *= 0.45;
-    if (!carBlocked(nx, p.z, 2.05, car)) { p.x = nx; car.vz = 0; }
-    else if (!carBlocked(p.x, nz, 2.05, car)) { p.z = nz; car.vx = 0; }
-    else { car.vx = 0; car.vz = 0; car.yawRate = 0; }
+    if (!carPoseBlocked(nx, p.z, car.heading, car)) { p.x = nx; car.vz = 0; }
+    else if (!carPoseBlocked(p.x, nz, car.heading, car)) { p.z = nz; car.vx = 0; }
+    else { const ss = Math.hypot(car.vx, car.vz);
+           if (ss > 4) addDamage(car, Math.min(0.4, (ss - 4) * 0.03), (car.vx * Math.sin(car.heading) + car.vz * Math.cos(car.heading)) > 0);
+           car.vx = 0; car.vz = 0; car.yawRate = 0; }
   }
-  car.heading += car.yawRate * dt;
+  const spun = car.heading + car.yawRate * dt;
+  if (!carPoseBlocked(p.x, p.z, spun, car)) car.heading = spun; else car.yawRate = 0;
   p.y = groundY(p.x, p.z);
   car.g.rotation.y = car.heading;
   const damp = Math.exp(-2.6 * dt);
@@ -1388,16 +1682,19 @@ function updateTraffic(dt) {
          the route (waypoints are absolute, so recovery is automatic) */
       car.knockT -= dt;
       const nx = p.x + car.kx * dt, nz = p.z + car.kz * dt;
-      if (!carBlocked(nx, nz, 2.05, car)) { p.x = nx; p.z = nz; }
+      if (!carPoseBlocked(nx, nz, car.heading, car)) { p.x = nx; p.z = nz; }
       else {
         const other = nearestOtherCar(nx, nz, 4.6, car);
         if (other) ramInto(car, other, car.kx, car.kz);
         car.kx *= 0.45; car.kz *= 0.45;
-        if (!carBlocked(nx, p.z, 2.05, car)) { p.x = nx; car.kz = 0; }
-        else if (!carBlocked(p.x, nz, 2.05, car)) { p.z = nz; car.kx = 0; }
-        else { car.kx = 0; car.kz = 0; }
+        if (!carPoseBlocked(nx, p.z, car.heading, car)) { p.x = nx; car.kz = 0; }
+        else if (!carPoseBlocked(p.x, nz, car.heading, car)) { p.z = nz; car.kx = 0; }
+        else { const ks = Math.hypot(car.kx, car.kz);
+               if (ks > 4) addDamage(car, Math.min(0.4, (ks - 4) * 0.03), (car.kx * Math.sin(car.heading) + car.kz * Math.cos(car.heading)) > 0);
+               car.kx = 0; car.kz = 0; }
       }
-      car.heading += car.yawRate * dt;
+      const spunK = car.heading + car.yawRate * dt;
+      if (!carPoseBlocked(p.x, p.z, spunK, car)) car.heading = spunK; else car.yawRate = 0;
       const kd = Math.exp(-3.0 * dt);
       car.kx *= kd; car.kz *= kd; car.yawRate *= Math.exp(-3.4 * dt);
       car.v = 0;
@@ -1413,7 +1710,8 @@ function updateTraffic(dt) {
     let dx = wp.x - p.x, dz = wp.z - p.z;
     if (dx * dx + dz * dz < 49) { t.wi = (t.wi + 1) % 4; wp = t.wp[t.wi]; dx = wp.x - p.x; dz = wp.z - p.z; }
     const desired = Math.atan2(dx, dz);
-    car.heading = lerpAngle(car.heading, desired, 1 - Math.exp(-3.0 * dt));
+    const turned = lerpAngle(car.heading, desired, 1 - Math.exp(-3.0 * dt));
+    if (!carPoseBlocked(p.x, p.z, turned, car)) car.heading = turned;   // never swing the corners into a wall
     const fx = Math.sin(car.heading), fz = Math.cos(car.heading);
     const frontX = p.x + fx * 7.5, frontZ = p.z + fz * 7.5;
     let target = t.cruise;
@@ -1425,9 +1723,23 @@ function updateTraffic(dt) {
     if (target !== 0) for (const o of cruisers) {   // traffic also brakes for police units
       if (Math.hypot(o.g.position.x - frontX, o.g.position.z - frontZ) < 6) { target = 0; break; }
     }
+    /* slow for corners: the wider the heading error, the gentler the
+       pace — the turn stays on the road instead of cutting the block */
+    let dhA = desired - car.heading;
+    while (dhA > Math.PI) dhA -= Math.PI * 2; while (dhA < -Math.PI) dhA += Math.PI * 2;
+    target *= clamp(1.15 - Math.abs(dhA) * 0.5, 0.35, 1);
     const rate = target < car.v ? 16 : 6;
     car.v += clamp(target - car.v, -rate * dt, rate * dt);
-    p.x += fx * car.v * dt; p.z += fz * car.v * dt; p.y = groundY(p.x, p.z);
+    /* pose-checked move (this path used to have NO building check at
+       all — traffic drove straight through blocks): the whole
+       footprint must fit, axis-separated so the car slides along a
+       wall face instead of entering it, and stops if it cannot fit */
+    const mvx = fx * car.v * dt, mvz = fz * car.v * dt;
+    if (!carPoseBlocked(p.x + mvx, p.z + mvz, car.heading, car)) { p.x += mvx; p.z += mvz; }
+    else if (!carPoseBlocked(p.x + mvx, p.z, car.heading, car)) { p.x += mvx; car.v *= 0.6; }
+    else if (!carPoseBlocked(p.x, p.z + mvz, car.heading, car)) { p.z += mvz; car.v *= 0.6; }
+    else car.v = 0;
+    p.y = groundY(p.x, p.z);
     carryPlayerOn(car, ox, oz, oh);
     car.g.rotation.y = car.heading;
     car.spin += car.v * dt / 0.34;
@@ -1513,7 +1825,7 @@ function shoveCar(other, byCar) {
   let dx = op.x - bp.x, dz = op.z - bp.z;
   const d = Math.hypot(dx, dz) || 1; dx /= d; dz /= d;
   const nx = op.x + dx * 0.32, nz = op.z + dz * 0.32;
-  if (!carBlocked(nx, nz, 2.05, other)) { op.x = nx; op.z = nz; op.y = groundY(nx, nz); }
+  if (!carPoseBlocked(nx, nz, other.heading, other)) { op.x = nx; op.z = nz; op.y = groundY(nx, nz); }
   const bv = byCar.v || 0;
   const along = Math.sin(byCar.heading) * bv * dx + Math.cos(byCar.heading) * bv * dz;
   const proj = dx * Math.sin(other.heading) + dz * Math.cos(other.heading);
@@ -1531,6 +1843,15 @@ function ramInto(attacker, defender, avx, avz) {
   const d = Math.hypot(dx, dz) || 1; dx /= d; dz /= d;
   const along = avx * dx + avz * dz;
   if (along <= 0.4) return 0;
+  /* crash damage: both cars crumple at the struck end — the defender
+     takes the bigger share. Hard hits also throw a spark burst via
+     addDamage. Damage is permanent; nothing resets it. */
+  if (along > 3.0) {
+    const amt = Math.min(0.5, (along - 3.0) * 0.028);
+    const defLocalZ = -(dx * Math.sin(defender.heading) + dz * Math.cos(defender.heading));
+    addDamage(defender, amt, defLocalZ > 0);
+    addDamage(attacker, amt * 0.75, (avx * Math.sin(attacker.heading) + avz * Math.cos(attacker.heading)) > 0);
+  }
   const rx = ap.x - dp.x, rz = ap.z - dp.z;            // hit offset from the defender's centre
   const torque = clamp((rz * avx - rx * avz) * 0.045, -1.8, 1.8);   // r x F, y-component
   if (defender.traffic) {
@@ -1633,17 +1954,24 @@ function updateCruiser(car, dt) {
     const ex = p.x - dx * 1.5, ez = p.z - dz * 1.5;   // escape point away from the player
     const rt = routeTarget(car, ex, ez);
     sx = rt.x; sz = rt.z;
-    if (Math.hypot(sx - p.x, sz - p.z) < 4.5) { sx = ex; sz = ez; }
+    if (Math.hypot(sx - p.x, sz - p.z) < 4.5 && !segBlocked(p.x, p.z, ex, ez)) { sx = ex; sz = ez; }
   } else if (car.dodgeT > 0) {
     car.dodgeT -= dt;
     const px = dz / (dist || 1), pz = -dx / (dist || 1);
     sx = tp.x + px * car.dodgeSide * 9; sz = tp.z + pz * car.dodgeSide * 9;
+    if (carBlocked(sx, sz, 2.05, car)) {          // the dodge point sits inside a block: take the other side
+      car.dodgeSide = -car.dodgeSide;
+      sx = tp.x + px * car.dodgeSide * 9; sz = tp.z + pz * car.dodgeSide * 9;
+      if (carBlocked(sx, sz, 2.05, car)) { const rt = routeTarget(car, tp.x, tp.z); sx = rt.x; sz = rt.z; }
+    }
   } else if (dist < 20 && !segBlocked(p.x, p.z, tp.x, tp.z)) {
     sx = tp.x; sz = tp.z; seeking = true;
   } else {
     const rt = routeTarget(car, tp.x, tp.z);
     sx = rt.x; sz = rt.z;
-    if (Math.hypot(sx - p.x, sz - p.z) < 4.5) { sx = tp.x; sz = tp.z; seeking = true; }
+    /* final approach: beeline to the suspect only with a clear line —
+       a building between here and there means stay on the grid */
+    if (Math.hypot(sx - p.x, sz - p.z) < 4.5 && !segBlocked(p.x, p.z, tp.x, tp.z)) { sx = tp.x; sz = tp.z; seeking = true; }
   }
   let targetSpeed;
   if (car.state === 'leave') {
@@ -1661,15 +1989,20 @@ function updateCruiser(car, dt) {
   const steerTgt = car.revT > 0 ? clamp(-diff * 1.2, -0.6, 0.6) : clamp(diff * 1.35, -0.58, 0.58);
   car.steer = lerp(car.steer, steerTgt, 1 - Math.exp(-9 * dt));
   car.v += clamp(targetSpeed - car.v, -26 * dt, 12.5 * dt);
+  /* pose-gated move, same as the player's car: position and heading
+     are only adopted if the whole footprint fits there */
+  const oldHeading = car.heading;
   car.heading += (car.v / 2.7) * Math.tan(car.steer) * dt;
-  const ox = p.x, oz = p.z;
-  p.x += Math.sin(car.heading) * car.v * dt;
-  p.z += Math.cos(car.heading) * car.v * dt;
-  if (carBlocked(p.x, p.z, 2.05, car)) {
-    p.x = ox; p.z = oz;
+  const nx = p.x + Math.sin(car.heading) * car.v * dt;
+  const nz = p.z + Math.cos(car.heading) * car.v * dt;
+  if (!carPoseBlocked(nx, nz, car.heading, car)) { p.x = nx; p.z = nz; }
+  else if (!carPoseBlocked(nx, nz, oldHeading, car)) { p.x = nx; p.z = nz; car.heading = oldHeading; }
+  else {
+    car.heading = oldHeading;
     const blocker = nearestOtherCar(p.x, p.z, 4.6, car);
     if (blocker === currentCar && currentCar) shoveCar(currentCar, car);
     else if (blocker && !blocker.police) ramInto(car, blocker, Math.sin(car.heading) * car.v, Math.cos(car.heading) * car.v);
+    else if (!blocker) { const imp = Math.abs(car.v); if (imp > 3.2) addDamage(car, Math.min(0.45, (imp - 3.2) * 0.032), car.v > 0); }
     car.v = -car.v * 0.25; if (Math.abs(car.v) < 0.6) car.v = 0;
     if (car.state === 'pursue') car.stuckT += dt * 2;
   }
@@ -1841,6 +2174,7 @@ function animate() {
   updateTraffic(dt);
   updatePolice(dt);
   updateParkedCars(dt);
+  updateParticles(dt);
   updateHeli(dt);
   updateCamera(dt);
   if (AC && engGain) {
@@ -1882,13 +2216,24 @@ window.__solano = {
   setKey: (code, down) => { keys[code] = !!down; },
   feetY: () => player.y,
   gait: () => { const r3 = v => Math.round(v * 1000) / 1000, gd = player._gait || {};
+    const fw = new THREE.Vector3();
+    const footYL = player.footL.getWorldPosition(fw).y - player.y;
+    const footYR = player.footR.getWorldPosition(fw).y - player.y;
     return { phase: Math.round(player.phase * 100) / 100, mw: Math.round(player.mw * 100) / 100,
              spd: Math.round(Math.hypot(player.vx, player.vz) * 100) / 100,
              runW: r3(player.runW), hipAmp: r3(gd.hipAmp || 0), kneeAmp: r3(gd.kneeAmp || 0),
              elbowBase: r3(gd.elbowBase || 0), armAmp: r3(gd.armAmp || 0),
+             torsoYawAmp: r3(gd.torsoYawAmp || 0), pelvisYawAmp: r3(gd.pelvisYawAmp || 0),
+             pelvisRollAmp: r3(gd.pelvisRollAmp || 0), armLag: r3(gd.armLag || 0),
              torsoX: r3(player.torso.rotation.x), hipX: r3(player.legL.rotation.x),
              kneeX: r3(player.kneeL.rotation.x), elbowX: r3(player.elbowL.rotation.x),
-             bodyY: r3(player.body.position.y) }; },
+             pelvisY: r3(player.pelvis.rotation.y), torsoY: r3(player.torso.rotation.y),
+             pelvisZ: r3(player.pelvis.rotation.z), torsoZ: r3(player.torso.rotation.z),
+             shoulderX: r3(player.armL.rotation.x), shoulderZ: r3(player.armL.rotation.z),
+             headY: r3(player.head.rotation.y), headZ: r3(player.head.rotation.z),
+             bodyY: r3(player.body.position.y), bodyX: r3(player.body.position.x),
+             footYL: r3(footYL), footYR: r3(footYR),
+             joyMag: r3(joy.mag), joyActive: joy.active }; },
   grounded: () => player.grounded,
   standingOnCar: () => !!player.standingOn,
   promptOn: () => promptEl.classList.contains('on'),
@@ -1902,7 +2247,21 @@ window.__solano = {
   debugCars: () => allCars.map(c => ({ x: c.g.position.x, z: c.g.position.z, heading: c.heading,
                                         v: c.v, traffic: !!c.traffic, style: c.style,
                                         slide: Math.round(Math.hypot(c.vx || 0, c.vz || 0) * 100) / 100,
-                                        yawRate: Math.round((c.yawRate || 0) * 100) / 100 })),
+                                        yawRate: Math.round((c.yawRate || 0) * 100) / 100,
+                                        dmg: Math.round(((c.dmgF || 0) + (c.dmgR || 0)) * 100) / 100,
+                                        dmgF: Math.round((c.dmgF || 0) * 100) / 100,
+                                        dmgR: Math.round((c.dmgR || 0) * 100) / 100 })),
+  poseInBuilding: (x, z, hd) => obbHitsColliders(x, z, Math.sin(hd), Math.cos(hd)),
+  nearestCollider: (x, z) => { let best = null;
+    for (const b of colliders) { const dx = Math.max(b.minX - x, 0, x - b.maxX), dz = Math.max(b.minZ - z, 0, z - b.maxZ);
+      const d = Math.hypot(dx, dz);
+      if (!best || d < best.d) best = { d: Math.round(d * 100) / 100, minX: b.minX, maxX: b.maxX, minZ: b.minZ, maxZ: b.maxZ, top: b.top === undefined ? null : b.top }; }
+    return best; },
+  debugDamage: (x, z, amt, front) => {           // test hook: bend the nearest car by hand
+    const c = nearestOtherCar(x, z, 6, null);
+    if (c) { addDamage(c, amt, !!front); return Math.round(((c.dmgF || 0) + (c.dmgR || 0)) * 100) / 100; }
+    return -1;
+  },
   wanted: () => starsNow(),
   heat: () => Math.round(heat * 1000) / 1000,
   cruiserCount: () => cruisers.filter(c => c.state === 'pursue').length,
@@ -1914,6 +2273,10 @@ window.__solano = {
   bustMeter: () => Math.round(bust * 100) / 100,
   bustedCount: () => bustedCount,
   debugSetHeading: (h) => { if (currentCar) { currentCar.heading = h; currentCar.g.rotation.y = h; currentCar.v = 0; } },
+  debugMoveCar: (x, z, hd) => { if (!currentCar) return false;
+    currentCar.g.position.set(x, groundY(x, z), z);
+    currentCar.heading = hd; currentCar.g.rotation.y = hd; currentCar.v = 0;
+    player.pos.copy(currentCar.g.position); return true; },
   blockerAt: (x, z) => {           // diagnostic: what would carBlocked(x, z, 2.05) hit?
     if (x < -166 || x > 236 || z < -166 || z > 166) return 'bounds';
     if (x > 157 && groundY(x, z) < 0.3) return 'sea';
